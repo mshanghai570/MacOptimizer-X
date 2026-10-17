@@ -270,19 +270,17 @@ final class BatchedUIUpdaterTests: XCTestCase {
     }
     
     func testDebounceWithCustomDelay() async {
-        var executed = false
+        let executed = expectation(description: "debounced action executed")
         let startTime = Date()
         
         // Use custom delay
         await updater.debounce("test", delay: 0.02) {
-            executed = true
+            executed.fulfill()
         }
-        
-        // Wait for execution
-        try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
+
+        await fulfillment(of: [executed], timeout: 1.0)
         
         let elapsed = Date().timeIntervalSince(startTime)
-        XCTAssertTrue(executed, "Should execute after custom delay")
         XCTAssertGreaterThanOrEqual(elapsed, 0.02, "Should respect custom delay")
     }
     

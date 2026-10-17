@@ -235,13 +235,16 @@ final class PerformanceMonitorTests: XCTestCase {
         let averages = monitor.averageOperationTime
         XCTAssertEqual(averages.count, 3, "Should have 3 operations")
         
-        // Verify ordering by duration
+        // Verify each measured operation includes at least its requested work.
+        // Avoid comparing wall-clock timings: a shared CI runner can pause any
+        // individual thread and legitimately reverse their apparent ordering.
         let fileIOTime = averages["fileIO"] ?? 0
         let processingTime = averages["dataProcessing"] ?? 0
         let uiTime = averages["uiUpdate"] ?? 0
         
-        XCTAssertGreaterThan(fileIOTime, processingTime, "fileIO should take longer than processing")
-        XCTAssertGreaterThan(processingTime, uiTime, "processing should take longer than UI")
+        XCTAssertGreaterThanOrEqual(fileIOTime, 0.03)
+        XCTAssertGreaterThanOrEqual(processingTime, 0.02)
+        XCTAssertGreaterThanOrEqual(uiTime, 0.01)
     }
     
     func testMonitoringWithRepeatedOperations() {
