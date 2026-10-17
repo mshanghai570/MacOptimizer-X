@@ -275,6 +275,12 @@ class DeepCleanScanner: ObservableObject {
             items.contains { $0.category == cat && $0.isSelected }
         }
         
+        // The .Trash folder itself can never be moved into the Trash; deleting
+        // it via trashItem always fails and silently eats the largest junk item
+        // (often several GB). Empty its contents instead.
+        let trashURL = fileManager.homeDirectoryForCurrentUser.appendingPathComponent(".Trash")
+        let trashItemPath = trashURL.standardizedFileURL.path
+        
         print("[DeepClean] 📋 找到 \(categoriesWithSelection.count) 个需要清理的分类")
         
         // 如果没有选中任何项目，直接返回
@@ -319,6 +325,19 @@ class DeepCleanScanner: ObservableObject {
             var permissionRetryItems: [DeepCleanItem] = []
             
             for item in categoryItems {
+                // Trash is emptied by deleting its children directly — the
+                // items inside are already in the Trash, so DeletionLogService
+                // (which moves to Trash) has nothing to record here.
+                if item.url.standardizedFileURL.path == trashItemPath {
+                    let (emptiedCount, emptiedSize) = await Self.emptyTrashContents(at: trashURL)
+                    totalDeletedCount += emptiedCount
+                    totalDeletedSize += emptiedSize
+                    await MainActor.run {
+                        self.items.removeAll { $0.id == item.id }
+                    }
+                    continue
+                }
+                
                 // ⚠️ 安全修复: 使用SafetyGuard检查
                 if !SafetyGuard.shared.isSafeToDelete(item.url) {
                     print("[DeepClean] 🛡️ SafetyGuard blocked deletion: \(item.url.path)")
@@ -1172,6 +1191,30 @@ class DeepCleanScanner: ObservableObject {
         }
     }
     
+    /// Empties the contents of .Trash. Items inside are already trashed, so
+    /// this permanently removes them and reports how much space was freed.
+    /// Failed children are left in place and are not counted.
+    private static func emptyTrashContents(at trashURL: URL) async -> (count: Int, size: Int64) {
+        let fileManager = FileManager.default
+        guard let children = try? fileManager.contentsOfDirectory(at: trashURL, includingPropertiesForKeys: nil, options: []) else {
+            return (0, 0)
+        }
+
+        var count = 0
+        var size: Int64 = 0
+        for child in children {
+            let childSize = await calculateSizeAsync(at: child)
+            do {
+                try fileManager.removeItem(at: child)
+                count += 1
+                size += childSize
+            } catch {
+                print("[DeepClean] ⚠️ Failed to remove trash item: \(child.path) - \(error.localizedDescription)")
+            }
+        }
+        return (count, size)
+    }
+
     /// 删除单个项目
     @MainActor
     func deleteSingleItem(_ item: DeepCleanItem) async -> Bool {
@@ -1181,6 +1224,15 @@ class DeepCleanScanner: ObservableObject {
             return false
         }
         
+        let trashURL = fileManager.homeDirectoryForCurrentUser.appendingPathComponent(".Trash")
+        if item.url.standardizedFileURL.path == trashURL.standardizedFileURL.path {
+            let (emptiedCount, emptiedSize) = await Self.emptyTrashContents(at: trashURL)
+            guard emptiedCount > 0 else { return false }
+            items.removeAll { $0.id == item.id }
+            totalSize = max(0, totalSize - emptiedSize)
+            return true
+        }
+
         if DeletionLogService.shared.logAndDelete(at: item.url, category: "DeepClean") {
             items.removeAll { $0.id == item.id }
             totalSize = max(0, totalSize - item.size)

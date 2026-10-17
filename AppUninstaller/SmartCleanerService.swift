@@ -1003,7 +1003,14 @@ class SmartCleanerService: ObservableObject {
         // 3. 扫描用户缓存
         await updateProgress(step: currentStep, total: totalSteps, message: "正在扫描用户缓存...")
         let usrCache = await scanUserCache()
-        await MainActor.run { userCacheFiles = visible(usrCache) }
+        // ~/Library/Caches is enumerated by both the system-cache pass and
+        // the user-cache pass; publish each folder once so the aggregated
+        // System Junk total cannot double-count the same directory.
+        let systemCachePaths = Set(sysCache.map { $0.url.standardizedFileURL.path })
+        let dedupedUserCache = usrCache.filter { !systemCachePaths.contains($0.url.standardizedFileURL.path) }
+        await MainActor.run {
+            userCacheFiles = visible(dedupedUserCache)
+        }
         currentStep += 1
         
         // 3.5 扫描废纸篓
@@ -1682,6 +1689,14 @@ class SmartCleanerService: ObservableObject {
         }
         
         // 9. 更新服务状态
+        // Explicit developer-cache entries can repeat folders already listed
+        // in the loose-items path; publish each path once.
+        var seenItemPaths = Set<String>()
+        items = items.filter { seenItemPaths.insert($0.url.standardizedFileURL.path).inserted }
+        for group in groupsMap.values {
+            var seenInGroup = Set<String>()
+            group.files.removeAll { !seenInGroup.insert($0.url.standardizedFileURL.path).inserted }
+        }
         let finalGroups = Array(groupsMap.values).sorted { $0.totalSize > $1.totalSize }
         await MainActor.run {
             self.appCacheGroups = finalGroups
@@ -2664,6 +2679,32 @@ class SmartCleanerService: ObservableObject {
         return totalSize
     }
     
+    /// Size of a single file or a recursively-visited directory tree.
+    /// Safe to call from detached tasks and other agents (no instance state).
+    private static func recursiveSize(of url: URL) -> Int64 {
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) else { return 0 }
+        
+        if !isDirectory.boolValue {
+            return Int64((try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
+        }
+        
+        var totalSize: Int64 = 0
+        guard let enumerator = FileManager.default.enumerator(
+            at: url,
+            includingPropertiesForKeys: [.fileSizeKey],
+            options: [],
+            errorHandler: { _, _ in true }
+        ) else { return 0 }
+        
+        for case let fileURL as URL in enumerator {
+            if let size = try? fileURL.resourceValues(forKeys: [.fileSizeKey]).fileSize {
+                totalSize += Int64(size)
+            }
+        }
+        return totalSize
+    }
+    
     // MARK: - 统计
     
     func selectedCount(for category: CleanerCategory) -> Int {
@@ -2937,6 +2978,57 @@ class SmartCleanerService: ObservableObject {
             self.totalCleanedSize = 0
             self.totalResolvedThreats = 0
             self.totalOptimizedItems = 0
+        }
+        
+        // 0. 清理废纸篓 (empty .Trash contents)
+        // The displayed System Junk total includes the Trash, so skipping it
+        // made "Run" delete only a fraction of the advertised size. Items
+        // inside .Trash are already trashed; remove them directly instead of
+        // trying to move .Trash itself into the Trash (which always fails).
+        if trashFiles.contains(where: { $0.isSelected }) {
+            await MainActor.run {
+                cleaningCurrentCategory = .trash
+                cleaningDescription = "Cleaning Trash..."
+            }
+            
+            let trashURL = fileManager.homeDirectoryForCurrentUser.appendingPathComponent(".Trash")
+            let manager = fileManager
+            let trashStage = await Task.detached(priority: .userInitiated) { () -> (success: Int, size: Int64, failed: Int) in
+                var success = 0
+                var freedSize: Int64 = 0
+                var failed = 0
+                guard let children = try? manager.contentsOfDirectory(at: trashURL, includingPropertiesForKeys: nil, options: []) else {
+                    return (0, 0, 0)
+                }
+                for child in children {
+                    let childSize = Self.recursiveSize(of: child)
+                    do {
+                        try manager.removeItem(at: child)
+                        success += 1
+                        freedSize += childSize
+                    } catch {
+                        print("[SmartCleaner] ⚠️ Failed to remove trash item: \(child.path) - \(error.localizedDescription)")
+                        failed += 1
+                    }
+                }
+                return (success, freedSize, failed)
+            }.value
+            
+            totalSuccess += trashStage.success
+            totalSize += trashStage.size
+            totalFailed += trashStage.failed
+            await MainActor.run {
+                self.totalCleanedSize += trashStage.size
+                // Refresh the published Trash entry so the result screen shows
+                // what is actually left over instead of the pre-clean size.
+                let remaining = Self.recursiveSize(of: trashURL)
+                trashFiles = trashFiles.compactMap { item in
+                    guard item.url.standardizedFileURL.path == trashURL.standardizedFileURL.path else { return item }
+                    guard remaining > 1024 else { return nil }
+                    return CleanerFileItem(url: item.url, name: item.name, size: remaining, groupId: item.groupId, isSelected: item.isSelected)
+                }
+                _ = cleanedCategories.insert(.trash)
+            }
         }
         
         // 1. 清理系统垃圾 (System Junk + User Cache)

@@ -440,7 +440,7 @@ final class AIAssistantCoordinator: ObservableObject {
         Return exactly one JSON object and no Markdown:
         {"tool":"scan_junk|scan_large_files|scan_duplicates|inspect_storage|inspect_system|inspect_startup|list_results|prepare_cleanup|finish","arguments":{"minimumSizeMB":100,"olderThanDays":3},"message":"localized final analysis"}
         Tool rules:
-        - scan_junk directly scans local caches, logs, crash reports, and saved application state.
+        - scan_junk directly scans caches, logs, crash reports, saved application state, plus Xcode and developer junk (DerivedData, iOS/watchOS/tvOS DeviceSupport, simulator caches) and package-manager caches (npm, Gradle, Maven, Go).
         - scan_large_files directly scans user content. It never selects large files for automatic cleanup.
         - scan_duplicates directly groups files by size and verifies byte-identical copies with SHA-256. Duplicate files require manual review and are never automatically selected for cleanup.
         - inspect_storage reads real local disk capacity.
