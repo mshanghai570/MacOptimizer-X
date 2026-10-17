@@ -573,7 +573,7 @@ struct UninstallerReplicaView: View {
             var failed = 0
             for app in targets {
                 await appScanner.scanResidualFiles(for: app)
-                let result = await fileRemover.removeApp(app, includeApp: true, moveToTrash: true)
+                _ = await fileRemover.removeApp(app, includeApp: true, moveToTrash: true)
                 if !FileManager.default.fileExists(atPath: app.path.path) {
                     success += 1
                     selectedAppIDs.remove(app.id)

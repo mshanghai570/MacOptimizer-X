@@ -3235,10 +3235,17 @@ class SmartCleanerService: ObservableObject {
             Task { @MainActor in isCleaning = false }
         }
         
-        let explicitUserPaths = Set(
-            largeFiles.filter(\.isSelected).map { $0.url.standardizedFileURL.path }
-            + duplicateGroups.flatMap { $0.files.filter(\.isSelected).map { $0.url.standardizedFileURL.path } }
-            + similarPhotoGroups.flatMap { $0.files.filter(\.isSelected).map { $0.url.standardizedFileURL.path } }
+        let selectedLargeFilePaths: [String] = largeFiles
+            .filter { $0.isSelected }
+            .map { $0.url.standardizedFileURL.path }
+        let selectedDuplicatePaths: [String] = duplicateGroups.flatMap { group in
+            group.files.filter { $0.isSelected }.map { $0.url.standardizedFileURL.path }
+        }
+        let selectedSimilarPhotoPaths: [String] = similarPhotoGroups.flatMap { group in
+            group.files.filter { $0.isSelected }.map { $0.url.standardizedFileURL.path }
+        }
+        let explicitUserPaths: Set<String> = Set(
+            selectedLargeFilePaths + selectedDuplicatePaths + selectedSimilarPhotoPaths
         )
         let safeFiles = files.filter { file in
             SafetyGuard.shared.isSafeToDelete(
@@ -3246,7 +3253,8 @@ class SmartCleanerService: ObservableObject {
                 ignoreProtection: explicitUserPaths.contains(file.url.standardizedFileURL.path)
             )
         }
-        let results = await FileRemover().removeItemsWithPrivilege(paths: safeFiles.map(\.url))
+        let safeURLs: [URL] = safeFiles.map { $0.url }
+        let results = await FileRemover().removeItemsWithPrivilege(paths: safeURLs)
         var totalSuccess = 0
         var totalSize: Int64 = 0
         for (index, file) in safeFiles.enumerated() where index < results.count && results[index] {
