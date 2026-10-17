@@ -571,6 +571,10 @@ class JunkCleaner: ObservableObject {
         
         // 排序：按大小降序
         await MainActor.run {
+            var seenPaths = Set<String>()
+            self.junkItems = self.junkItems.filter {
+                seenPaths.insert($0.path.standardizedFileURL.path).inserted
+            }
             self.junkItems.sort { $0.size > $1.size }
         }
         
@@ -1005,18 +1009,20 @@ class JunkCleaner: ObservableObject {
         // 如果有失败的项目，尝试使用 sudo 权限删除
         if !failedItems.isEmpty {
             let failedPaths = failedItems.map { $0.path.path }
-            let (sudoCleanedSize, sudoSuccess) = await cleanWithAdminPrivileges(paths: failedPaths, items: failedItems)
-            if sudoSuccess {
+            let (sudoCleanedSize, deletedPaths) = await cleanWithAdminPrivileges(paths: failedPaths, items: failedItems)
+            if !deletedPaths.isEmpty {
                 cleanedSize += sudoCleanedSize
                 failedSize -= sudoCleanedSize
-            } else {
+            }
+            if deletedPaths.count != failedItems.count {
                 needsAdmin = true
             }
         }
         
-        await MainActor.run { [failedItems] in
+        let pathsStillPresent = Set(failedItems.map(\.path.path).filter { self.fileManager.fileExists(atPath: $0) })
+        await MainActor.run {
             self.junkItems.removeAll { item in
-                selectedItems.contains { $0.id == item.id } && !failedItems.contains { $0.id == item.id }
+                selectedItems.contains { $0.id == item.id } && !pathsStillPresent.contains(item.path.path)
             }
             // 更新磁盘空间显示
             DiskSpaceManager.shared.updateDiskSpace()
@@ -1094,17 +1100,21 @@ class JunkCleaner: ObservableObject {
             let wasStopped = await MainActor.run { self.stopCleaningRequested }
             if !wasStopped && !categoryFailedItems.isEmpty {
                 let failedPaths = categoryFailedItems.map { $0.path.path }
-                let (sudoCleanedSize, sudoSuccess) = await cleanWithAdminPrivileges(paths: failedPaths, items: categoryFailedItems)
-                if sudoSuccess {
+                let (sudoCleanedSize, deletedPaths) = await cleanWithAdminPrivileges(paths: failedPaths, items: categoryFailedItems)
+                if !deletedPaths.isEmpty {
                     categoryCleanedSize += sudoCleanedSize
                     totalCleanedSize += sudoCleanedSize
                     totalFailedSize -= sudoCleanedSize
+                    for item in categoryFailedItems where deletedPaths.contains(item.path.path) {
+                        cleanedItemIDs.insert(item.id)
+                    }
                     // 先捕获值以避免 Swift 6 警告
                     let currentCleanedSize = categoryCleanedSize
                     await MainActor.run {
                         self.categoryCleanedSize[category] = currentCleanedSize
                     }
-                } else {
+                }
+                if deletedPaths.count != categoryFailedItems.count {
                     needsAdmin = true
                 }
             }
@@ -1153,53 +1163,21 @@ class JunkCleaner: ObservableObject {
     }
     
     /// 使用管理员权限清理（通过 AppleScript）
-    private func cleanWithAdminPrivileges(paths: [String], items: [JunkItem]) async -> (Int64, Bool) {
+    private func cleanWithAdminPrivileges(paths: [String], items: [JunkItem]) async -> (size: Int64, deletedPaths: Set<String>) {
+        let safeItems = items.filter {
+            paths.contains($0.path.path) && SafetyGuard.shared.isSafeToDelete($0.path)
+        }
+        if safeItems.isEmpty {
+            return (0, [])
+        }
+        let results = await FileRemover().removeItemsWithPrivilege(paths: safeItems.map(\.path))
+        var deletedPaths = Set<String>()
         var cleanedSize: Int64 = 0
-        var safePaths: [String] = []
-        
-        // 1. 安全检查
-        for path in paths {
-            if SafetyGuard.shared.isSafeToDelete(URL(fileURLWithPath: path)) {
-                safePaths.append(path)
-            } else {
-                print("[JunkCleaner] 🛡️ Skipped unsafe path in privileged clean: \(path)")
-            }
+        for (index, item) in safeItems.enumerated() where index < results.count && results[index] {
+            deletedPaths.insert(item.path.path)
+            cleanedSize += item.size
         }
-        
-        if safePaths.isEmpty {
-            return (0, false)
-        }
-        
-        // 2. 构建删除命令
-        // 使用 rm -rf 
-        let escapedPaths = safePaths.map { path in
-            path.replacingOccurrences(of: "'", with: "'\\''")
-        }
-        
-        let rmCommands = escapedPaths.map { "rm -rf '\($0)'" }.joined(separator: " && ")
-        
-        let script = """
-        do shell script "\(rmCommands)" with administrator privileges
-        """
-        
-        var error: NSDictionary?
-        if let appleScript = NSAppleScript(source: script) {
-            appleScript.executeAndReturnError(&error)
-            
-            if error == nil {
-                // 成功，计算清理的大小
-                for path in safePaths {
-                    if let item = items.first(where: { $0.path.path == path }) {
-                        cleanedSize += item.size
-                    }
-                }
-                return (cleanedSize, true)
-            } else {
-                 print("[JunkCleaner] AppleScript error: \(String(describing: error))")
-            }
-        }
-        
-        return (0, false)
+        return (cleanedSize, deletedPaths)
     }
     
     private func scanType(_ type: JunkType) async -> [JunkItem] {

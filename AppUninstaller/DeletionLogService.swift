@@ -65,7 +65,18 @@ class DeletionLogService: ObservableObject {
     /// - Returns: 删除是否成功
     @discardableResult
     func logAndDelete(at url: URL, category: String = "SmartClean") -> Bool {
-        let originalPath = url.path
+        let normalizedURL = url.standardizedFileURL
+        let originalPath = normalizedURL.path
+
+        // Scan results can overlap (for example a cache directory and one of its
+        // children) or become stale while a cleanup is running.  Deletion is an
+        // idempotent operation: if the requested path is already gone, the
+        // requested end state has been reached and must not be reported as a
+        // failure or trigger an unnecessary administrator prompt.
+        guard fileManager.fileExists(atPath: originalPath) else {
+            print("[DeletionLog] ✅ Already removed: \(originalPath)")
+            return true
+        }
         
         // 获取文件大小
         let size: Int64
@@ -74,13 +85,21 @@ class DeletionLogService: ObservableObject {
             size = fileSize
         } else {
             // 如果是目录，计算总大小
-            size = calculateSize(at: url)
+            size = calculateSize(at: normalizedURL)
         }
         
         // 使用 trashItem 并获取废纸篓中的新路径
         var trashURL: NSURL?
         do {
-            try fileManager.trashItem(at: url, resultingItemURL: &trashURL)
+            try fileManager.trashItem(at: normalizedURL, resultingItemURL: &trashURL)
+
+            // FileManager returning without throwing is normally sufficient, but
+            // explicitly verify the source path so every caller gets trustworthy
+            // success accounting.
+            guard !fileManager.fileExists(atPath: originalPath) else {
+                print("[DeletionLog] ❌ Source still exists after trash operation: \(originalPath)")
+                return false
+            }
             
             let trashPath = trashURL?.path
             

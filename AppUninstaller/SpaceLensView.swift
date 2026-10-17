@@ -1052,49 +1052,56 @@ struct SpaceLensView: View {
     
     func deleteSelectedItems() {
         Task {
-            let fileManager = FileManager.default
+            let fileRemover = FileRemover()
             var deletedIDs: Set<UUID> = []
             var deletedSize: Int64 = 0
             var failedDeletions: [FailedFileInfo] = []
             
-            // First attempt: Try direct deletion
+            // First attempt: move to Trash so the operation is recoverable and
+            // use the same verified deletion path as the cleanup modules.
             for item in itemsToRemove {
-                do {
-                    try fileManager.removeItem(at: item.url)
+                guard SafetyGuard.shared.isSafeToDelete(item.url, ignoreProtection: true) else {
+                    failedDeletions.append(FailedFileInfo(
+                        fileName: item.name,
+                        filePath: item.url.path,
+                        fileSize: item.size,
+                        errorReason: "Blocked by safety rules"
+                    ))
+                    continue
+                }
+
+                if DeletionLogService.shared.logAndDelete(at: item.url, category: "SpaceLens") {
                     deletedIDs.insert(item.id)
                     deletedSize += item.size
                     print("Deleted: \(item.url.path)")
-                } catch {
-                    print("Failed to delete \(item.url.path): \(error)")
+                } else {
+                    print("Failed to delete \(item.url.path)")
                     // Track failed deletion for retry with admin privileges
                     failedDeletions.append(FailedFileInfo(
                         fileName: item.name,
                         filePath: item.url.path,
                         fileSize: item.size,
-                        errorReason: error.localizedDescription
+                        errorReason: "The item could not be moved to Trash"
                     ))
                 }
             }
             
             // Second attempt: If there are failures, try with admin privileges
             if !failedDeletions.isEmpty {
-                let failedPaths = failedDeletions.map { $0.filePath }
-                let adminSuccess = await deleteWithAdminPrivileges(paths: failedPaths)
-                
-                if adminSuccess {
-                    // All admin deletions succeeded
-                    let adminDeletedSize = failedDeletions.reduce(0) { $0 + $1.fileSize }
-                    deletedSize += adminDeletedSize
-                    
-                    // Mark items as deleted by matching paths
-                    for failedItem in failedDeletions {
-                        if let matchingItem = itemsToRemove.first(where: { $0.url.path == failedItem.filePath }) {
-                            deletedIDs.insert(matchingItem.id)
-                        }
+                let failedURLs = failedDeletions.map { URL(fileURLWithPath: $0.filePath) }
+                let results = await fileRemover.removeItemsWithPrivilege(paths: failedURLs)
+                var remainingFailures: [FailedFileInfo] = []
+
+                for (index, failedItem) in failedDeletions.enumerated() {
+                    let removed = index < results.count && results[index]
+                    if removed, let matchingItem = itemsToRemove.first(where: { $0.url.standardizedFileURL.path == failedItem.filePath }) {
+                        deletedIDs.insert(matchingItem.id)
+                        deletedSize += failedItem.fileSize
+                    } else {
+                        remainingFailures.append(failedItem)
                     }
-                    
-                    failedDeletions.removeAll()
                 }
+                failedDeletions = remainingFailures
             }
             
             // Update UI on main thread
@@ -1108,7 +1115,7 @@ struct SpaceLensView: View {
                     self.focusedNodeID = current.children.first?.id
                     
                     // Update total scanned size
-                    scanner.totalSize -= deletedSize
+                    scanner.totalSize = max(0, scanner.totalSize - deletedSize)
                 }
                 
                 // Store cleanup results
@@ -1133,36 +1140,6 @@ struct SpaceLensView: View {
         }
     }
     
-    /// Attempts to delete files with admin privileges using AppleScript
-    private func deleteWithAdminPrivileges(paths: [String]) async -> Bool {
-        var safePaths: [String] = []
-        
-        // Validate paths for safety
-        for path in paths {
-            if !path.contains("..") && !path.isEmpty {
-                safePaths.append(path)
-            }
-        }
-        
-        if safePaths.isEmpty {
-            return false
-        }
-        
-        // Build rm commands
-        let rmCommands = safePaths.map { "rm -rf '\($0)'" }.joined(separator: "; ")
-        
-        let script = """
-        do shell script "\(rmCommands)" with administrator privileges
-        """
-        
-        var error: NSDictionary?
-        if let scriptObject = NSAppleScript(source: script) {
-            scriptObject.executeAndReturnError(&error)
-            return error == nil
-        }
-        
-        return false
-    }
     
     func resetToLanding() {
         viewState = 0

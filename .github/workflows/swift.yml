@@ -1,22 +1,58 @@
 # This workflow will build a Swift project
 # For more information see: https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-swift
 
-name: Swift
+name: Intel macOS Build
 
 on:
+  workflow_dispatch:
   push:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
 
-jobs:
-  build:
+concurrency:
+  group: intel-macos-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
-    runs-on: macos-latest
+jobs:
+  build-intel:
+    runs-on: macos-15-intel
+    timeout-minutes: 45
 
     steps:
-    - uses: actions/checkout@v4
-    - name: Build
-      run: swift build -v
-    - name: Run tests
-      run: swift test -v
+      - uses: actions/checkout@v4
+
+      - name: Verify Intel runner
+        run: |
+          test "$(uname -m)" = "x86_64"
+          swift --version
+
+      - name: Run Intel tests
+        run: swift test --arch x86_64 -v
+
+      - name: Verify AI provider clients
+        run: |
+          swiftc -parse-as-library \
+            AppUninstaller/AIProviderService.swift \
+            scripts/verify_ai_provider_clients.swift \
+            -o "${RUNNER_TEMP}/verify-ai-providers"
+          "${RUNNER_TEMP}/verify-ai-providers"
+
+      - name: Build Intel app and DMG
+        run: scripts/build_intel_release.sh
+
+      - name: Verify Intel artifact
+        run: |
+          test "$(lipo -archs 'build_intel/Mac优化大师.app/Contents/MacOS/AppUninstaller')" = "x86_64"
+          codesign --verify --deep --strict --verbose=2 "build_intel/Mac优化大师.app"
+          hdiutil verify build_intel/MacOptimizer-Intel.dmg
+
+      - name: Upload Intel build
+        uses: actions/upload-artifact@v4
+        with:
+          name: MacOptimizer-Intel-${{ github.sha }}
+          path: |
+            build_intel/MacOptimizer-Intel.dmg
+            build_intel/MacOptimizer-Intel.dmg.sha256
+          if-no-files-found: error
+          retention-days: 30

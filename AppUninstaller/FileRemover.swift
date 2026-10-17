@@ -14,13 +14,44 @@ class FileRemover {
         
         // 收集所有需要删除的路径
         var pathsToDelete: [(URL, Int64)] = []
-        
+
+        // Remove the bundle first. If that operation is denied or cancelled, do
+        // not destroy the application's support data before discovering that the
+        // app itself could not be uninstalled.
+        if includeApp {
+            if isAppRunning(app) {
+                _ = terminateApp(app)
+                for _ in 0..<10 where isAppRunning(app) {
+                    try? await Task.sleep(nanoseconds: 100_000_000)
+                }
+                if isAppRunning(app) {
+                    _ = forceTerminateApp(app)
+                }
+            }
+            let removedNormally = await removeItemNormal(at: app.path, moveToTrash: moveToTrash)
+            var removed = removedNormally
+            if !removed {
+                removed = await removeItemWithPrivilege(at: app.path)
+            }
+            guard removed else {
+                return RemovalResult(
+                    successCount: 0,
+                    failedCount: 1,
+                    totalSizeRemoved: 0,
+                    failedPaths: [app.path]
+                )
+            }
+            successCount += 1
+            totalSizeRemoved += app.size
+        }
+
         for file in app.residualFiles where file.isSelected {
             pathsToDelete.append((file.path, file.size))
         }
-        
-        if includeApp {
-            pathsToDelete.append((app.path, app.size))
+
+        var seenPaths = Set<String>()
+        pathsToDelete = pathsToDelete.filter {
+            seenPaths.insert($0.0.standardizedFileURL.path).inserted
         }
         
         // 先尝试普通删除
@@ -109,6 +140,7 @@ class FileRemover {
     
     /// 普通删除（不提权）
     private func removeItemNormal(at url: URL, moveToTrash: Bool) async -> Bool {
+        guard fileManager.fileExists(atPath: url.path) else { return true }
         if moveToTrash {
             // 🛡️ 使用 DeletionLogService 记录删除日志，支持恢复
             return DeletionLogService.shared.logAndDelete(at: url, category: "AppUninstall")
@@ -125,13 +157,19 @@ class FileRemover {
     
     /// 使用管理员权限删除文件（通过 AppleScript）
     /// 会弹出密码输入框请求用户授权
-    private func removeItemsWithPrivilege(paths: [URL]) async -> [Bool] {
+    func removeItemsWithPrivilege(paths: [URL]) async -> [Bool] {
         guard !paths.isEmpty else { return [] }
         
         // 对路径进行正确的 shell 转义
         func shellEscape(_ path: String) -> String {
             let escaped = path.replacingOccurrences(of: "'", with: "'\\''")
             return "'\(escaped)'"
+        }
+
+        func appleScriptStringEscape(_ value: String) -> String {
+            value
+                .replacingOccurrences(of: "\\", with: "\\\\")
+                .replacingOccurrences(of: "\"", with: "\\\"")
         }
         
         // 构建一个脚本，逐个删除每个路径，忽略单个错误
@@ -208,8 +246,9 @@ class FileRemover {
             
             safePathsCount += 1
             let escapedPath = shellEscape(pathStr)
-            // 每个删除命令后加 || true，即使失败也继续
-            scriptLines.append("rm -rf \(escapedPath) 2>/dev/null || true")
+            // 每个删除命令后加 || true，即使失败也继续。最终结果始终
+            // 通过逐路径存在性检查确定，而不是依赖 shell 的退出状态。
+            scriptLines.append("/bin/rm -rf \(escapedPath) 2>/dev/null || true")
         }
         
         if safePathsCount == 0 {
@@ -220,7 +259,7 @@ class FileRemover {
         let shellCommands = scriptLines.joined(separator: "; ")
         
         let script = """
-        do shell script "\(shellCommands)" with administrator privileges
+        do shell script "\(appleScriptStringEscape(shellCommands))" with administrator privileges
         """
         
         print("执行提权删除脚本，共 \(paths.count) 个路径")

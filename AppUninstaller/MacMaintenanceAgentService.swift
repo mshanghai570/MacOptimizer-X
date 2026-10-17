@@ -108,7 +108,11 @@ final class MacMaintenanceAgentService: ObservableObject {
             report = lastReport ?? .init(tool: .listResults, findings: [], facts: ["state": "no_previous_scan"])
         case .prepareCleanup:
             let source: MacAgentToolReport
-            if let lastReport {
+            // Only junk-scan findings are valid input for automatic cleanup.
+            // Reusing a previous storage/system/large-file report made a later
+            // "clean junk" request prepare zero items and look like the agent
+            // had ignored the command.
+            if let lastReport, lastReport.tool == .scanJunk {
                 source = lastReport
             } else {
                 source = await Task.detached(priority: .userInitiated) { Self.scanJunk(olderThanDays: 3) }.value

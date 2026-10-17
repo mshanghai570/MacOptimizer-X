@@ -574,7 +574,7 @@ struct UninstallerReplicaView: View {
             for app in targets {
                 await appScanner.scanResidualFiles(for: app)
                 let result = await fileRemover.removeApp(app, includeApp: true, moveToTrash: true)
-                if result.failedCount == 0 {
+                if !FileManager.default.fileExists(atPath: app.path.path) {
                     success += 1
                     selectedAppIDs.remove(app.id)
                     await appScanner.removeFromList(app: app)
@@ -593,13 +593,16 @@ struct UninstallerReplicaView: View {
         isRemoving = true
         if app.residualFiles.isEmpty { await appScanner.scanResidualFiles(for: app) }
         let result = await fileRemover.removeApp(app, includeApp: includeApp, moveToTrash: moveToTrash)
-        if result.failedCount == 0 && includeApp {
+        let appWasRemoved = includeApp && !FileManager.default.fileExists(atPath: app.path.path)
+        if appWasRemoved {
             await appScanner.removeFromList(app: app)
             selectedAppIDs.remove(app.id)
             detailedApp = nil
         }
         resultMessage = result.failedCount == 0
             ? localized("操作成功完成。", "Operation completed successfully.")
+            : appWasRemoved
+                ? localized("应用程序已卸载，但有 \(result.failedCount) 个残留项目无法移除。", "The app was uninstalled, but \(result.failedCount) leftover items could not be removed.")
             : localized("有 \(result.failedCount) 个项目失败并已保留。", "\(result.failedCount) items failed and remain listed.")
         isRemoving = false
         showResult = true

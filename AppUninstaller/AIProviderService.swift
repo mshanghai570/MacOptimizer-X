@@ -207,12 +207,25 @@ private struct AIKeychainStore {
     }
 }
 
-enum AIProviderError: Error {
+enum AIProviderError: Error, LocalizedError {
     case invalidBaseURL
     case invalidResponse
-    case httpStatus(Int)
+    case httpStatus(Int, String?)
     case emptyResponse
     case fileStorage
+    case transport(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidBaseURL: return "The AI provider Base URL is invalid."
+        case .invalidResponse: return "The AI provider returned an unsupported response."
+        case let .httpStatus(code, message):
+            return message.map { "HTTP \(code): \($0)" } ?? "The AI provider returned HTTP \(code)."
+        case .emptyResponse: return "The AI provider returned an empty response."
+        case .fileStorage: return "The AI provider settings could not be saved."
+        case let .transport(message): return message
+        }
+    }
 }
 
 struct AIProviderClient {
@@ -238,6 +251,35 @@ struct AIProviderClient {
         }
     }
 
+    /// Loads model identifiers from an OpenAI-compatible `GET /models`
+    /// endpoint. The standard response is `data[].id`; some local gateways put
+    /// equivalent records under `models`, so accept both shapes.
+    func listOpenAICompatibleModels(baseURL: String, apiKey: String) async throws -> [String] {
+        let url = try endpoint(baseURL: baseURL, suffix: "models")
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.timeoutInterval = 30
+        let normalizedKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !normalizedKey.isEmpty {
+            request.setValue("Bearer \(normalizedKey)", forHTTPHeaderField: "Authorization")
+        }
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+
+        let payload = try await send(request)
+        let rawModels = (payload["data"] as? [Any]) ?? (payload["models"] as? [Any]) ?? []
+        let identifiers = rawModels.compactMap { value -> String? in
+            if let identifier = value as? String { return identifier }
+            guard let object = value as? [String: Any] else { return nil }
+            return (object["id"] as? String)
+                ?? (object["name"] as? String)
+                ?? (object["model"] as? String)
+        }
+        let unique = Set(identifiers.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) })
+            .filter { !$0.isEmpty }
+        guard !unique.isEmpty else { throw AIProviderError.invalidResponse }
+        return unique.sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+    }
+
     private func requestOpenAI(
         _ configuration: AIProviderConfiguration,
         systemPrompt: String,
@@ -247,6 +289,7 @@ struct AIProviderClient {
         let url = try endpoint(baseURL: configuration.baseURL, suffix: "chat/completions")
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
+        request.timeoutInterval = 60
         request.setValue("Bearer \(configuration.apiKey)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         let userContent: Any
@@ -264,15 +307,21 @@ struct AIProviderClient {
             })
             userContent = parts
         }
-        request.httpBody = try JSONSerialization.data(withJSONObject: [
+        var body: [String: Any] = [
             "model": configuration.model,
-            "temperature": 0,
             "stream": false,
             "messages": [
                 ["role": "system", "content": systemPrompt],
                 ["role": "user", "content": userContent]
             ]
-        ])
+        ]
+        // Official OpenAI Chat Completions supports JSON mode. Compatible
+        // gateways are left prompt-driven because some do not implement this
+        // field even though they expose the same endpoint shape.
+        if url.host?.lowercased() == "api.openai.com" {
+            body["response_format"] = ["type": "json_object"]
+        }
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
         let payload = try await send(request)
         let choices = payload["choices"] as? [[String: Any]]
@@ -305,6 +354,7 @@ struct AIProviderClient {
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
+        request.timeoutInterval = 60
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         var parts: [[String: Any]] = [["text": userPrompt]]
         parts.append(contentsOf: attachments.map { attachment in
@@ -339,6 +389,7 @@ struct AIProviderClient {
         let url = try endpoint(baseURL: configuration.baseURL, suffix: "messages")
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
+        request.timeoutInterval = 60
         request.setValue(configuration.apiKey, forHTTPHeaderField: "x-api-key")
         request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -387,14 +438,38 @@ struct AIProviderClient {
     }
 
     private func send(_ request: URLRequest) async throws -> [String: Any] {
-        let (data, response) = try await session.data(for: request)
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await session.data(for: request)
+        } catch {
+            throw AIProviderError.transport(error.localizedDescription)
+        }
         guard let http = response as? HTTPURLResponse else { throw AIProviderError.invalidResponse }
-        guard (200..<300).contains(http.statusCode) else { throw AIProviderError.httpStatus(http.statusCode) }
+        guard (200..<300).contains(http.statusCode) else {
+            throw AIProviderError.httpStatus(http.statusCode, providerErrorMessage(from: data))
+        }
         guard !data.isEmpty else { throw AIProviderError.emptyResponse }
         guard let payload = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw AIProviderError.invalidResponse
         }
         return payload
+    }
+
+    private func providerErrorMessage(from data: Data) -> String? {
+        guard !data.isEmpty,
+              let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        let nestedError = payload["error"] as? [String: Any]
+        let message = (nestedError?["message"] as? String)
+            ?? (payload["message"] as? String)
+            ?? (payload["error_description"] as? String)
+            ?? (payload["promptFeedback"] as? [String: Any])?["blockReason"] as? String
+        return message?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .prefix(500)
+            .description
     }
 
     private func endpoint(baseURL: String, suffix: String) throws -> URL {
