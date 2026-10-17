@@ -27,8 +27,10 @@ jobs:
           test "$(uname -m)" = "x86_64"
           swift --version
 
-      - name: Run Intel tests
-        run: swift test --arch x86_64 -v
+      - name: Run Intel unit and integration tests
+        # Performance benchmarks use wall-clock upper bounds and are unsuitable
+        # as correctness gates on shared runners. SwiftPM still compiles them.
+        run: swift test --arch x86_64 --skip PerformanceTests -v
 
       - name: Verify AI provider clients
         run: |

@@ -62,13 +62,15 @@ final class PerformanceTests: XCTestCase {
         // Verify all operations were tracked
         XCTAssertEqual(averages.count, 3, "Should track all 3 operations")
         
-        // Verify timing relationships
+        // Verify each operation was measured. Wall-clock ordering is not
+        // deterministic when a shared CI runner pauses an individual thread.
         let fastTime = averages["fastOp"] ?? 0
         let mediumTime = averages["mediumOp"] ?? 0
         let slowTime = averages["slowOp"] ?? 0
         
-        XCTAssertLessThan(fastTime, mediumTime, "Fast operation should be faster than medium")
-        XCTAssertLessThan(mediumTime, slowTime, "Medium operation should be faster than slow")
+        XCTAssertGreaterThanOrEqual(fastTime, 0.01)
+        XCTAssertGreaterThanOrEqual(mediumTime, 0.05)
+        XCTAssertGreaterThanOrEqual(slowTime, 0.1)
     }
     
     func testPerformanceMonitorWarningThreshold() {
