@@ -1040,6 +1040,8 @@ class JunkCleaner: ObservableObject {
         var totalFailedSize: Int64 = 0
         var needsAdmin = false
         var cleanedItemIDs = Set<UUID>()
+        // Trashed by this run so the space can actually be reclaimed afterwards.
+        var trashedRecords: [TrashRecord] = []
 
         await MainActor.run {
             self.stopCleaningRequested = false
@@ -1079,8 +1081,9 @@ class JunkCleaner: ObservableObject {
             for item in categoryItems {
                 if await MainActor.run(body: { self.stopCleaningRequested }) { break }
 
-                let success = await deleteItem(item)
-                if success {
+                let record = await deleteItemReturningRecord(item)
+                if let record {
+                    trashedRecords.append(record)
                     categoryCleanedSize += item.size
                     totalCleanedSize += item.size
                     cleanedItemIDs.insert(item.id)
@@ -1128,6 +1131,13 @@ class JunkCleaner: ObservableObject {
             try? await Task.sleep(nanoseconds: 300_000_000) // 0.3秒
         }
         
+        // Trashing junk frees no disk space — purge what this run trashed so the
+        // reported cleaned size is what the user actually gets back.
+        if !trashedRecords.isEmpty {
+            let purged = DeletionLogService.shared.purgeTrashItems(trashedRecords)
+            print("[JunkCleaner] 🧹 Purged \(purged.count) trashed items (\(purged.bytes) bytes) to reclaim space")
+        }
+        
         // 4. 从 junkItems 中移除已清理的项目
         let completedItemIDs = cleanedItemIDs
         await MainActor.run {
@@ -1146,19 +1156,24 @@ class JunkCleaner: ObservableObject {
     
     /// 删除单个项目
     private func deleteItem(_ item: JunkItem) async -> Bool {
+        await deleteItemReturningRecord(item) != nil
+    }
+
+    /// 删除单个项目并返回删除记录，便于清理结束后真正回收磁盘空间。
+    private func deleteItemReturningRecord(_ item: JunkItem) async -> TrashRecord? {
         // ⚠️ 安全修复: 使用SafetyGuard检查
         if !SafetyGuard.shared.isSafeToDelete(item.path) {
             print("[JunkCleaner] 🛡️ SafetyGuard blocked deletion: \(item.path.path)")
-            return false
+            return nil
         }
         
         // 🛡️ 使用 DeletionLogService 记录删除日志，支持恢复
-        if DeletionLogService.shared.logAndDelete(at: item.path, category: "JunkClean") {
+        if let record = DeletionLogService.shared.trashAndRecord(at: item.path, category: "JunkClean") {
             print("[JunkCleaner] ✅ Moved to trash with log: \(item.path.lastPathComponent)")
-            return true
+            return record
         } else {
             print("[JunkCleaner] ⚠️ Failed to delete: \(item.path.lastPathComponent)")
-            return false
+            return nil
         }
     }
     

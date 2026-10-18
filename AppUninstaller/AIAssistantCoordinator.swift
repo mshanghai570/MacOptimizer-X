@@ -404,6 +404,13 @@ final class AIAssistantCoordinator: ObservableObject {
                 decision = .init(tool: latestReport == nil ? .scanJunk : .finish, arguments: nil, message: nil)
             }
 
+            // The agent must look before it talks. A finish/list_results on the
+            // first step answered from nothing, which is how the chat ended up
+            // reporting "0 MB of junk" without ever scanning the Mac.
+            if latestReport == nil, decision.tool == .finish || decision.tool == .listResults {
+                decision = .init(tool: .scanJunk, arguments: nil, message: nil)
+            }
+
             if decision.tool == .finish {
                 let reportText = latestReport.map(agentReportMessage) ?? agentReadyMessage
                 let analysis = decision.message?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -440,7 +447,7 @@ final class AIAssistantCoordinator: ObservableObject {
         Return exactly one JSON object and no Markdown:
         {"tool":"scan_junk|scan_large_files|scan_duplicates|inspect_storage|inspect_system|inspect_startup|list_results|prepare_cleanup|finish","arguments":{"minimumSizeMB":100,"olderThanDays":3},"message":"localized final analysis"}
         Tool rules:
-        - scan_junk directly scans caches, logs, crash reports, saved application state, plus Xcode and developer junk (DerivedData, iOS/watchOS/tvOS DeviceSupport, simulator caches) and package-manager caches (npm, Gradle, Maven, Go).
+        - scan_junk directly scans caches, logs, crash reports, saved application state, plus Xcode and developer junk (DerivedData, iOS/watchOS/tvOS DeviceSupport, simulator caches) and package-manager caches (npm, Gradle, Maven, Go). Call it with no arguments to include every cache and log regardless of age; "olderThanDays" is optional and only limits by modification date.
         - scan_large_files directly scans user content. It never selects large files for automatic cleanup.
         - scan_duplicates directly groups files by size and verifies byte-identical copies with SHA-256. Duplicate files require manual review and are never automatically selected for cleanup.
         - inspect_storage reads real local disk capacity.
@@ -471,7 +478,7 @@ final class AIAssistantCoordinator: ObservableObject {
             return .init(tool: .scanDuplicates, arguments: nil, message: nil)
         }
         if explicitlyRequestsCleanup(request) {
-            return .init(tool: .prepareCleanup, arguments: .init(minimumSizeMB: nil, olderThanDays: 3), message: nil)
+            return .init(tool: .prepareCleanup, arguments: .init(minimumSizeMB: nil, olderThanDays: nil), message: nil)
         }
         if containsAny(["大文件", "大型", "large file", "big file", "大容量", "대용량", "большие файл"]) {
             return .init(tool: .scanLargeFiles, arguments: .init(minimumSizeMB: 100, olderThanDays: nil), message: nil)
@@ -485,7 +492,7 @@ final class AIAssistantCoordinator: ObservableObject {
         if containsAny(["性能", "发热", "内存", "performance", "thermal", "memory", "パフォーマンス", "メモリ", "성능", "메모리", "производительност", "память"]) {
             return .init(tool: .inspectSystem, arguments: nil, message: nil)
         }
-        return .init(tool: .scanJunk, arguments: .init(minimumSizeMB: nil, olderThanDays: 3), message: nil)
+        return .init(tool: .scanJunk, arguments: .init(minimumSizeMB: nil, olderThanDays: nil), message: nil)
     }
 
     private func explicitlyRequestsCleanup(_ request: String) -> Bool {

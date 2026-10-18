@@ -1010,6 +1010,18 @@ class SmartCleanerService: ObservableObject {
         let dedupedUserCache = usrCache.filter { !systemCachePaths.contains($0.url.standardizedFileURL.path) }
         await MainActor.run {
             userCacheFiles = visible(dedupedUserCache)
+            // scanSystemCache also adds ~/Library/Caches/* folders (Apple and
+            // developer caches) while scanUserCache groups the same folders by
+            // app. systemJunkTotalSize sums systemCacheFiles AND appCacheGroups,
+            // so an un-deduplicated folder was counted twice — the advertised
+            // total was roughly double what cleanup could ever delete.
+            // Keep exactly one owner per path.
+            let ownedPaths = Set(systemCacheFiles.map { $0.url.standardizedFileURL.path })
+                .union(userCacheFiles.map { $0.url.standardizedFileURL.path })
+            for group in appCacheGroups {
+                group.files.removeAll { ownedPaths.contains($0.url.standardizedFileURL.path) }
+            }
+            appCacheGroups.removeAll { $0.files.isEmpty }
         }
         currentStep += 1
         
@@ -2928,6 +2940,10 @@ class SmartCleanerService: ObservableObject {
         var totalFailed = 0
         var totalSize: Int64 = 0
         var failedFiles: [CleanerFileItem] = []
+        // Every item this run moves to the Trash, so the junk it just cleaned
+        // can be permanently purged afterwards. Trashing alone frees no disk
+        // space, which is why "cleaned X" never matched the space users got back.
+        var trashedRecords: [TrashRecord] = []
         
         // 辅助函数:安全删除文件
         func safeDelete(file: CleanerFileItem, bypassProtection: Bool = false) -> Bool {
@@ -2963,7 +2979,8 @@ class SmartCleanerService: ObservableObject {
             
             // 2. 🛡️ 使用 DeletionLogService 安全删除并记录日志
             // 这样文件可以从废纸篓恢复到原位置
-            if DeletionLogService.shared.logAndDelete(at: url, category: "SmartClean") {
+            if let record = DeletionLogService.shared.trashAndRecord(at: url, category: "SmartClean") {
+                trashedRecords.append(record)
                 print("[SmartCleaner] ✅ Moved to trash with log: \(file.name)")
                 return true
             } else {
@@ -3044,19 +3061,27 @@ class SmartCleanerService: ObservableObject {
                cleaningDescription = "Cleaning System Junk..."
            }
            
-           for file in systemJunk {
-               // Only clean selected files
-               guard file.isSelected else { continue }
-               
-               if safeDelete(file: file) {
-                   totalSize += file.size
-                   totalSuccess += 1
-                   await MainActor.run { self.totalCleanedSize += file.size }
-               } else { totalFailed += 1 }
-           }
-           
-           await MainActor.run { _ = cleanedCategories.insert(.systemJunk) }
-           try? await Task.sleep(nanoseconds: 500_000_000)
+            for file in systemJunk {
+                // Only clean selected files
+                guard file.isSelected else { continue }
+                
+                if safeDelete(file: file) {
+                    totalSize += file.size
+                    totalSuccess += 1
+                    await MainActor.run { self.totalCleanedSize += file.size }
+                } else { totalFailed += 1 }
+            }
+            
+            // Moving caches/logs to the Trash frees nothing on disk — purge what
+            // this stage trashed so the reported "cleaned X" becomes real free
+            // space. Only this run's entries are removed; the user's own Trash
+            // contents are untouched.
+            let purged = DeletionLogService.shared.purgeTrashItems(trashedRecords)
+            print("[SmartCleaner] 🧹 Purged \(purged.count) trashed junk items (\(purged.bytes) bytes) to reclaim space")
+            trashedRecords.removeAll()
+
+            await MainActor.run { _ = cleanedCategories.insert(.systemJunk) }
+            try? await Task.sleep(nanoseconds: 500_000_000)
         }
         
 

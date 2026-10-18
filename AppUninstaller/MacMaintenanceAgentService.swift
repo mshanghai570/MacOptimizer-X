@@ -93,7 +93,12 @@ final class MacMaintenanceAgentService: ObservableObject {
         let report: MacAgentToolReport
         switch tool {
         case .scanJunk:
-            let days = max(1, arguments?.olderThanDays ?? 3)
+            // No implicit age filter: caches, logs and developer junk are safe
+            // to remove regardless of when they were last touched. The previous
+            // default of "older than 3 days" made a scan on a normally-used Mac
+            // report a single file / 0 bytes, so the agent answered "0 MB of
+            // junk". An age limit is now only applied when explicitly requested.
+            let days = arguments?.olderThanDays.map { max(1, $0) }
             report = await Task.detached(priority: .userInitiated) { Self.scanJunk(olderThanDays: days) }.value
         case .scanLargeFiles:
             let minimumMB = max(10, arguments?.minimumSizeMB ?? 100)
@@ -117,7 +122,7 @@ final class MacMaintenanceAgentService: ObservableObject {
             if let lastReport, lastReport.tool == .scanJunk {
                 source = lastReport
             } else {
-                source = await Task.detached(priority: .userInitiated) { Self.scanJunk(olderThanDays: 3) }.value
+                source = await Task.detached(priority: .userInitiated) { Self.scanJunk(olderThanDays: nil) }.value
             }
             let safe = source.findings.filter(Self.isSafeCleanupFinding)
             pendingCleanup = safe
@@ -164,7 +169,7 @@ final class MacMaintenanceAgentService: ObservableObject {
         pendingCleanup = []
     }
 
-    nonisolated private static func scanJunk(olderThanDays: Int) -> MacAgentToolReport {
+    nonisolated private static func scanJunk(olderThanDays: Int?) -> MacAgentToolReport {
         let home = FileManager.default.homeDirectoryForCurrentUser
         let roots: [(URL, MacAgentFindingCategory)] = [
             (home.appendingPathComponent("Library/Caches", isDirectory: true), .userCache),
@@ -174,17 +179,22 @@ final class MacMaintenanceAgentService: ObservableObject {
             (URL(fileURLWithPath: "/Library/Caches", isDirectory: true), .systemCache),
             (URL(fileURLWithPath: "/Library/Logs", isDirectory: true), .systemLog)
         ]
-        let cutoff = Date().addingTimeInterval(-Double(olderThanDays) * 86_400)
+        let cutoff = olderThanDays.map { Date().addingTimeInterval(-Double($0) * 86_400) }
         var findings: [MacAgentFinding] = []
         for (root, category) in roots {
             findings.append(contentsOf: enumerateFiles(at: root, category: category, limit: 20_000) { values in
+                guard let cutoff else { return true }
                 guard let modified = values.contentModificationDate else { return true }
                 return modified < cutoff
             })
             if findings.count >= 20_000 { break }
         }
         findings.append(contentsOf: scanDeveloperJunk(in: home))
-        return .init(tool: .scanJunk, findings: Array(findings.prefix(20_000)), facts: ["older_than_days": String(olderThanDays)])
+        return .init(
+            tool: .scanJunk,
+            findings: Array(findings.prefix(20_000)),
+            facts: ["older_than_days": olderThanDays.map(String.init) ?? "any"]
+        )
     }
 
     /// Xcode and package-manager junk reported at directory granularity.

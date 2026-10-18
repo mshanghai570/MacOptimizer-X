@@ -66,25 +66,50 @@ class DeletionLogService: ObservableObject {
     @discardableResult
     func logAndDelete(at url: URL, category: String = "SmartClean") -> Bool {
         let normalizedURL = url.standardizedFileURL
-        let originalPath = normalizedURL.path
 
         // Scan results can overlap (for example a cache directory and one of its
         // children) or become stale while a cleanup is running.  Deletion is an
         // idempotent operation: if the requested path is already gone, the
         // requested end state has been reached and must not be reported as a
         // failure or trigger an unnecessary administrator prompt.
-        guard fileManager.fileExists(atPath: originalPath) else {
-            print("[DeletionLog] ✅ Already removed: \(originalPath)")
+        guard fileManager.fileExists(atPath: normalizedURL.path) else {
+            print("[DeletionLog] ✅ Already removed: \(normalizedURL.path)")
             return true
         }
-        
-        // 获取文件大小
+
+        return trashAndRecord(at: normalizedURL, category: category) != nil
+    }
+
+    /// Moves the item at `url` to the Trash and returns its log entry.
+    ///
+    /// Cleaners collect these entries and pass them to `purgeTrashItems`
+    /// afterwards: moving a file to the Trash does not free any disk space, so
+    /// without that step the "cleaned" figure on screen never matched the free
+    /// space the user actually got back.
+    @discardableResult
+    func trashAndRecord(at url: URL, category: String = "SmartClean") -> TrashRecord? {
+        let normalizedURL = url.standardizedFileURL
+        let originalPath = normalizedURL.path
+
+        // The path may have disappeared since it was scanned (another cleaner,
+        // the app quitting, a sibling cleanup of the same tree). The requested
+        // end state is already reached, so report success with nothing to purge.
+        guard fileManager.fileExists(atPath: originalPath) else {
+            print("[DeletionLog] ✅ Already removed: \(originalPath)")
+            return TrashRecord(originalPath: originalPath, trashPath: nil, size: 0, category: category)
+        }
+
+        // 获取文件大小：目录必须递归统计，attributes[.size] 只返回目录自身
+        // 的 inode 大小（通常几十字节），会让日志和统计严重偏小。
+        var isDirectory: ObjCBool = false
         let size: Int64
-        if let attrs = try? fileManager.attributesOfItem(atPath: originalPath),
-           let fileSize = attrs[.size] as? Int64 {
+        if fileManager.fileExists(atPath: originalPath, isDirectory: &isDirectory),
+           isDirectory.boolValue {
+            size = calculateSize(at: normalizedURL)
+        } else if let attrs = try? fileManager.attributesOfItem(atPath: originalPath),
+                  let fileSize = attrs[.size] as? Int64 {
             size = fileSize
         } else {
-            // 如果是目录，计算总大小
             size = calculateSize(at: normalizedURL)
         }
         
@@ -98,7 +123,7 @@ class DeletionLogService: ObservableObject {
             // success accounting.
             guard !fileManager.fileExists(atPath: originalPath) else {
                 print("[DeletionLog] ❌ Source still exists after trash operation: \(originalPath)")
-                return false
+                return nil
             }
             
             let trashPath = trashURL?.path
@@ -120,12 +145,39 @@ class DeletionLogService: ObservableObject {
             saveRecord(record)
             
             print("[DeletionLog] ✅ Logged deletion: \(originalPath) -> \(trashPath ?? "unknown")")
-            return true
+            return record
             
         } catch {
             print("[DeletionLog] ❌ Failed to delete: \(originalPath) - \(error.localizedDescription)")
-            return false
+            return nil
         }
+    }
+
+    /// Permanently removes Trash entries that a cleanup run just created, so the
+    /// bytes reported as cleaned are really reclaimed. Only the supplied records
+    /// are touched — anything the user had put in the Trash before the run is
+    /// left alone. Log entries are kept as an audit trail; their dangling
+    /// trashPath makes them un-restorable, which matches the file being gone.
+    @discardableResult
+    func purgeTrashItems(_ records: [TrashRecord]) -> (count: Int, bytes: Int64) {
+        var count = 0
+        var bytes: Int64 = 0
+        for record in records {
+            guard let trashPath = record.trashPath else { continue }
+            let url = URL(fileURLWithPath: trashPath)
+            guard fileManager.fileExists(atPath: trashPath) else { continue }
+            var isDirectory: ObjCBool = false
+            _ = fileManager.fileExists(atPath: trashPath, isDirectory: &isDirectory)
+            let size = isDirectory.boolValue ? calculateSize(at: url) : record.size
+            do {
+                try fileManager.removeItem(at: url)
+                count += 1
+                bytes += size
+            } catch {
+                print("[DeletionLog] ⚠️ Failed to purge trashed item: \(trashPath) - \(error.localizedDescription)")
+            }
+        }
+        return (count, bytes)
     }
     
     /// 恢复文件到原位置

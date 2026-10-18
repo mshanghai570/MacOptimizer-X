@@ -294,6 +294,11 @@ class DeepCleanScanner: ObservableObject {
         
         let totalCategories = Double(categoriesWithSelection.count)
         let privilegedRemover = FileRemover()
+        // Junk this run moved to the Trash. Trashing frees no disk space, so it
+        // is purged after cleaning to make the reported "deleted X" real. Large
+        // files are user content and deliberately stay in the Trash so they can
+        // still be recovered.
+        var trashedJunkRecords: [TrashRecord] = []
         
         for (index, category) in categoriesWithSelection.enumerated() {
             print("[DeepClean] 🔄 开始清理分类: \(category.localizedName)")
@@ -346,9 +351,12 @@ class DeepCleanScanner: ObservableObject {
                     continue
                 }
                 
-                if DeletionLogService.shared.logAndDelete(at: item.url, category: "DeepClean") {
+                if let record = DeletionLogService.shared.trashAndRecord(at: item.url, category: "DeepClean") {
                     totalDeletedCount += 1
                     totalDeletedSize += item.size
+                    if category != .largeFiles {
+                        trashedJunkRecords.append(record)
+                    }
                 } else {
                     print("Delete failed for \(item.url)")
                     categoryFailures.append(item.url)
@@ -392,6 +400,14 @@ class DeepCleanScanner: ObservableObject {
             
             // Small delay for visual pacing (reduced from 300ms to 100ms)
             try? await Task.sleep(nanoseconds: 100_000_000) // 0.1s
+        }
+        
+        // Trashing junk does not reclaim disk space; remove what this run
+        // trashed so the freed total matches reality. Large Files stay in the
+        // Trash (recoverable) and are untouched here.
+        if !trashedJunkRecords.isEmpty {
+            let purged = DeletionLogService.shared.purgeTrashItems(trashedJunkRecords)
+            print("[DeepClean] 🧹 Purged \(purged.count) trashed junk items (\(purged.bytes) bytes) to reclaim space")
         }
         
         let finalDeletedSize = totalDeletedSize
