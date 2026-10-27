@@ -16,6 +16,7 @@ enum MacAgentTool: String, Codable, CaseIterable {
 struct MacAgentArguments: Codable {
     var minimumSizeMB: Int?
     var olderThanDays: Int?
+    var categories: [String]?
 }
 
 struct MacAgentDecision: Decodable {
@@ -31,10 +32,14 @@ enum MacAgentFindingCategory: String, Sendable {
     case savedState
     case systemCache
     case systemLog
+    case containerCache
     case largeFile
     case duplicateFile
     case startupItem
     case xcodeJunk
+    case xcodeArchives
+    case simulatorData
+    case iosBackup
     case devCache
 }
 
@@ -124,7 +129,7 @@ final class MacMaintenanceAgentService: ObservableObject {
             } else {
                 source = await Task.detached(priority: .userInitiated) { Self.scanJunk(olderThanDays: nil) }.value
             }
-            let safe = source.findings.filter(Self.isSafeCleanupFinding)
+            let safe = Self.filteredCleanupFindings(from: source.findings, categories: arguments?.categories)
             pendingCleanup = safe
             report = .init(
                 tool: .prepareCleanup,
@@ -169,6 +174,20 @@ final class MacMaintenanceAgentService: ObservableObject {
         pendingCleanup = []
     }
 
+    /// Applies the safety allowlist first, then an optional category filter so
+    /// a request like "clean only Xcode junk" prepares only that category.
+    nonisolated private static func filteredCleanupFindings(
+        from findings: [MacAgentFinding],
+        categories: [String]?
+    ) -> [MacAgentFinding] {
+        var safe = findings.filter(isSafeCleanupFinding)
+        if let categories, !categories.isEmpty {
+            let requested = Set(categories.map { $0.lowercased() })
+            safe = safe.filter { requested.contains($0.category.rawValue.lowercased()) }
+        }
+        return safe
+    }
+
     nonisolated private static func scanJunk(olderThanDays: Int?) -> MacAgentToolReport {
         let home = FileManager.default.homeDirectoryForCurrentUser
         let roots: [(URL, MacAgentFindingCategory)] = [
@@ -190,6 +209,7 @@ final class MacMaintenanceAgentService: ObservableObject {
             if findings.count >= 20_000 { break }
         }
         findings.append(contentsOf: scanDeveloperJunk(in: home))
+        findings.append(contentsOf: scanSandboxedCaches(in: home, cutoff: cutoff))
         return .init(
             tool: .scanJunk,
             findings: Array(findings.prefix(20_000)),
@@ -201,19 +221,37 @@ final class MacMaintenanceAgentService: ObservableObject {
     /// DerivedData, DeviceSupport and simulator caches are fully regenerated
     /// by the toolchain, so they are safe to remove regardless of age; the
     /// whole caches of npm/Gradle/Maven/Go are equally disposable.
+    /// Archives, device logs, simulator device data and iOS backups are
+    /// reported for review only and are never selected for automatic cleanup.
     nonisolated private static func scanDeveloperJunk(in home: URL) -> [MacAgentFinding] {
         let topLevelRoots: [(URL, MacAgentFindingCategory)] = [
             (home.appendingPathComponent("Library/Developer/Xcode/DerivedData", isDirectory: true), .xcodeJunk),
             (home.appendingPathComponent("Library/Developer/Xcode/iOS DeviceSupport", isDirectory: true), .xcodeJunk),
             (home.appendingPathComponent("Library/Developer/Xcode/watchOS DeviceSupport", isDirectory: true), .xcodeJunk),
             (home.appendingPathComponent("Library/Developer/Xcode/tvOS DeviceSupport", isDirectory: true), .xcodeJunk),
-            (home.appendingPathComponent("Library/Developer/CoreSimulator/Caches", isDirectory: true), .xcodeJunk)
+            (home.appendingPathComponent("Library/Developer/CoreSimulator/Caches", isDirectory: true), .xcodeJunk),
+            (home.appendingPathComponent("Library/Developer/Xcode/Archives", isDirectory: true), .xcodeArchives),
+            (home.appendingPathComponent("Library/Developer/Xcode/iOS Device Logs", isDirectory: true), .xcodeJunk),
+            (home.appendingPathComponent("Library/Developer/Xcode/watchOS Device Logs", isDirectory: true), .xcodeJunk),
+            (home.appendingPathComponent("Library/Developer/Xcode/tvOS Device Logs", isDirectory: true), .xcodeJunk),
+            (home.appendingPathComponent("Library/Developer/Xcode/Products", isDirectory: true), .xcodeJunk),
+            (home.appendingPathComponent("Library/Developer/Xcode/Previews", isDirectory: true), .xcodeJunk),
+            (home.appendingPathComponent("Library/Developer/CoreSimulator/Devices", isDirectory: true), .simulatorData),
+            (home.appendingPathComponent("Library/Application Support/MobileSync/Backup", isDirectory: true), .iosBackup)
         ]
         let wholeRoots: [(URL, MacAgentFindingCategory)] = [
             (home.appendingPathComponent(".npm/_cacache", isDirectory: true), .devCache),
             (home.appendingPathComponent(".gradle/caches", isDirectory: true), .devCache),
+            (home.appendingPathComponent(".gradle/wrapper", isDirectory: true), .devCache),
             (home.appendingPathComponent(".m2/repository", isDirectory: true), .devCache),
-            (home.appendingPathComponent("go/pkg/mod/cache", isDirectory: true), .devCache)
+            (home.appendingPathComponent("go/pkg/mod/cache", isDirectory: true), .devCache),
+            (home.appendingPathComponent(".cache/pip", isDirectory: true), .devCache),
+            (home.appendingPathComponent(".cargo/registry/cache", isDirectory: true), .devCache),
+            (home.appendingPathComponent(".pub-cache", isDirectory: true), .devCache),
+            (home.appendingPathComponent(".ivy2/cache", isDirectory: true), .devCache),
+            (home.appendingPathComponent(".pnpm-store", isDirectory: true), .devCache),
+            (home.appendingPathComponent("Library/pnpm/store", isDirectory: true), .devCache),
+            (home.appendingPathComponent("Library/org.swift.swiftpm", isDirectory: true), .devCache)
         ]
 
         var findings: [MacAgentFinding] = []
@@ -230,6 +268,35 @@ final class MacMaintenanceAgentService: ObservableObject {
             let size = directorySize(of: root)
             guard size > 0 else { continue }
             findings.append(.init(path: root.standardizedFileURL.path, category: category, size: size, modifiedAt: nil))
+        }
+        return findings
+    }
+
+    /// Caches hidden inside sandboxed apps: every installed app keeps its own
+    /// `Library/Caches` under `~/Library/Containers/<bundle-id>/Data` and
+    /// grouped extensions keep one under `~/Library/Group Containers/<group>`.
+    /// These are disposable by definition and are invisible to the plain
+    /// `Library/Caches` scan, which is how hundreds of MB survive cleanups.
+    nonisolated private static func scanSandboxedCaches(in home: URL, cutoff: Date?) -> [MacAgentFinding] {
+        let bases: [(URL, String)] = [
+            (home.appendingPathComponent("Library/Containers", isDirectory: true), "Data/Library/Caches"),
+            (home.appendingPathComponent("Library/Group Containers", isDirectory: true), "Library/Caches")
+        ]
+        var nestedRoots: [(URL, MacAgentFindingCategory)] = []
+        for (base, relativeCachePath) in bases {
+            guard let children = try? FileManager.default.contentsOfDirectory(
+                at: base, includingPropertiesForKeys: nil, options: []) else { continue }
+            for child in children {
+                nestedRoots.append((child.appendingPathComponent(relativeCachePath, isDirectory: true), .containerCache))
+            }
+        }
+        var findings: [MacAgentFinding] = []
+        for (root, category) in nestedRoots {
+            findings.append(contentsOf: enumerateFiles(at: root, category: category, limit: 20_000) { values in
+                guard let cutoff else { return true }
+                guard let modified = values.contentModificationDate else { return true }
+                return modified < cutoff
+            })
         }
         return findings
     }
@@ -408,8 +475,25 @@ final class MacMaintenanceAgentService: ObservableObject {
     nonisolated private static func isSafeCleanupFinding(_ finding: MacAgentFinding) -> Bool {
         guard finding.category != .largeFile,
               finding.category != .duplicateFile,
-              finding.category != .startupItem else { return false }
+              finding.category != .startupItem,
+              finding.category != .xcodeArchives,
+              finding.category != .simulatorData,
+              finding.category != .iosBackup else { return false }
         let home = FileManager.default.homeDirectoryForCurrentUser.standardizedFileURL.path
+        let normalized = URL(fileURLWithPath: finding.path).standardizedFileURL.path
+
+        // Sandboxed caches live inside containers; the allowlist check must be
+        // precise enough that only cache paths inside a container qualify,
+        // never the container itself.
+        if finding.category == .containerCache {
+            let containerPrefixes = [
+                "\(home)/Library/Containers/",
+                "\(home)/Library/Group Containers/"
+            ]
+            return containerPrefixes.contains(where: normalized.hasPrefix)
+                && (normalized.contains("/Data/Library/Caches/") || normalized.contains("/Library/Caches/"))
+        }
+
         let allowedRoots = [
             "\(home)/Library/Caches/",
             "\(home)/Library/Logs/",
@@ -422,14 +506,26 @@ final class MacMaintenanceAgentService: ObservableObject {
             "\(home)/Library/Developer/Xcode/iOS DeviceSupport/",
             "\(home)/Library/Developer/Xcode/watchOS DeviceSupport/",
             "\(home)/Library/Developer/Xcode/tvOS DeviceSupport/",
+            "\(home)/Library/Developer/Xcode/iOS Device Logs/",
+            "\(home)/Library/Developer/Xcode/watchOS Device Logs/",
+            "\(home)/Library/Developer/Xcode/tvOS Device Logs/",
+            "\(home)/Library/Developer/Xcode/Products/",
+            "\(home)/Library/Developer/Xcode/Previews/",
             "\(home)/Library/Developer/CoreSimulator/Caches/",
             // Package-manager dependency caches.
             "\(home)/.npm/_cacache",
             "\(home)/.gradle/caches",
+            "\(home)/.gradle/wrapper",
             "\(home)/.m2/repository",
-            "\(home)/go/pkg/mod/cache"
+            "\(home)/go/pkg/mod/cache",
+            "\(home)/.cache/pip",
+            "\(home)/.cargo/registry/cache",
+            "\(home)/.pub-cache",
+            "\(home)/.ivy2/cache",
+            "\(home)/.pnpm-store",
+            "\(home)/Library/pnpm/store",
+            "\(home)/Library/org.swift.swiftpm"
         ]
-        let normalized = URL(fileURLWithPath: finding.path).standardizedFileURL.path
         return allowedRoots.contains(where: normalized.hasPrefix)
     }
 }

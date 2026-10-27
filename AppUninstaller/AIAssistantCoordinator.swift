@@ -390,7 +390,7 @@ final class AIAssistantCoordinator: ObservableObject {
         """
         var latestReport: MacAgentToolReport?
 
-        for step in 0..<4 {
+        for step in 0..<6 {
             let raw = try await client.generateJSON(
                 configuration: configuration,
                 systemPrompt: maintenanceAgentSystemPrompt,
@@ -445,15 +445,15 @@ final class AIAssistantCoordinator: ObservableObject {
         You are Mac Optimization Agent, a specialized autonomous maintenance agent running inside a macOS utility.
         You choose local tools; the macOS app executes them directly against the local filesystem and returns real aggregate results. Do not claim you personally accessed a path unless a tool result confirms it. Do not refer to existing application modules or APIs.
         Return exactly one JSON object and no Markdown:
-        {"tool":"scan_junk|scan_large_files|scan_duplicates|inspect_storage|inspect_system|inspect_startup|list_results|prepare_cleanup|finish","arguments":{"minimumSizeMB":100,"olderThanDays":3},"message":"localized final analysis"}
+        {"tool":"scan_junk|scan_large_files|scan_duplicates|inspect_storage|inspect_system|inspect_startup|list_results|prepare_cleanup|finish","arguments":{"minimumSizeMB":100,"olderThanDays":3,"categories":["xcodeJunk"]},"message":"localized final analysis"}
         Tool rules:
-        - scan_junk directly scans caches, logs, crash reports, saved application state, plus Xcode and developer junk (DerivedData, iOS/watchOS/tvOS DeviceSupport, simulator caches) and package-manager caches (npm, Gradle, Maven, Go). Call it with no arguments to include every cache and log regardless of age; "olderThanDays" is optional and only limits by modification date.
+        - scan_junk performs the deep junk scan: user and system caches, logs, crash reports, saved application state, sandboxed app caches inside Library/Containers and Group Containers, Xcode junk (DerivedData, iOS/watchOS/tvOS DeviceSupport, device logs, Products, Previews, simulator caches, Archives) and package-manager caches (npm, pnpm, Gradle, Maven, Go, pip, Cargo, pub, Ivy, SwiftPM). It also reports Xcode Archives, simulator device data and iOS backups, which are review-only and never cleaned automatically. Call it with no arguments to include every cache and log regardless of age; "olderThanDays" is optional and only limits by modification date.
         - scan_large_files directly scans user content. It never selects large files for automatic cleanup.
         - scan_duplicates directly groups files by size and verifies byte-identical copies with SHA-256. Duplicate files require manual review and are never automatically selected for cleanup.
         - inspect_storage reads real local disk capacity.
         - inspect_system reads processor, memory, uptime, power, and thermal state.
         - inspect_startup reads local launch-agent files.
-        - prepare_cleanup may be used only when the user explicitly asks to clean or delete. It prepares recoverable cleanup and always waits for in-app confirmation.
+        - prepare_cleanup may be used only when the user explicitly asks to clean or delete. It prepares recoverable cleanup and always waits for in-app confirmation. Pass arguments.categories (array of category names such as xcodeJunk, containerCache, devCache, userCache) to limit preparation to the requested junk types; omit it to prepare all safe findings.
         - finish ends the loop. Its message must use only facts returned by tools, must not invent counts, sizes, diagnoses, paths, or completed cleanup.
         The interface language is \(LocalizationManager.shared.currentLanguage.rawValue). The message field must use that language only. JSON tool names stay exactly as specified.
         """
@@ -478,10 +478,10 @@ final class AIAssistantCoordinator: ObservableObject {
             return .init(tool: .scanDuplicates, arguments: nil, message: nil)
         }
         if explicitlyRequestsCleanup(request) {
-            return .init(tool: .prepareCleanup, arguments: .init(minimumSizeMB: nil, olderThanDays: nil), message: nil)
+            return .init(tool: .prepareCleanup, arguments: .init(minimumSizeMB: nil, olderThanDays: nil, categories: nil), message: nil)
         }
         if containsAny(["大文件", "大型", "large file", "big file", "大容量", "대용량", "большие файл"]) {
-            return .init(tool: .scanLargeFiles, arguments: .init(minimumSizeMB: 100, olderThanDays: nil), message: nil)
+            return .init(tool: .scanLargeFiles, arguments: .init(minimumSizeMB: 100, olderThanDays: nil, categories: nil), message: nil)
         }
         if containsAny(["磁盘", "空间", "disk", "storage", "ディスク", "ストレージ", "디스크", "저장 공간", "диск", "хранилищ"]) {
             return .init(tool: .inspectStorage, arguments: nil, message: nil)
@@ -492,7 +492,7 @@ final class AIAssistantCoordinator: ObservableObject {
         if containsAny(["性能", "发热", "内存", "performance", "thermal", "memory", "パフォーマンス", "メモリ", "성능", "메모리", "производительност", "память"]) {
             return .init(tool: .inspectSystem, arguments: nil, message: nil)
         }
-        return .init(tool: .scanJunk, arguments: .init(minimumSizeMB: nil, olderThanDays: nil), message: nil)
+        return .init(tool: .scanJunk, arguments: .init(minimumSizeMB: nil, olderThanDays: nil, categories: nil), message: nil)
     }
 
     private func explicitlyRequestsCleanup(_ request: String) -> Bool {
