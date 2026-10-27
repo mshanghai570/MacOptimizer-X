@@ -140,8 +140,9 @@ enum JunkType: String, CaseIterable, Identifiable {
         switch self {
         case .userCache: 
             return [
-                "~/Library/Saved Application State",
-                "~/Library/Cookies"
+                "~/Library/Saved Application State"
+                // ~/Library/Cookies 已移除：SafetyGuard 保护该目录，
+                // 列出的 Cookie 永远无法被清理，只会虚报可清理总量。
             ]
         case .systemCache:
             // 扫描用户级别的系统缓存
@@ -211,9 +212,9 @@ enum JunkType: String, CaseIterable, Identifiable {
                 "~/Library/Caches/net.whatsapp.WhatsApp",
                 "~/Library/Application Support/WhatsApp/Cache",
                 // Line
-                "~/Library/Caches/jp.naver.line.mac",
-                // iMessage 附件（可选择性清理）
-                "~/Library/Messages/Attachments"
+                "~/Library/Caches/jp.naver.line.mac"
+                // ~/Library/Messages/Attachments 已移除：SafetyGuard 保护
+                // ~/Library/Messages，列出的附件永远无法被清理。
             ]
         case .mailAttachments:
             return [
@@ -231,15 +232,14 @@ enum JunkType: String, CaseIterable, Identifiable {
             ]
         case .tempFiles:
             // Removed /tmp, /private - only user temp files
+            // ~/Downloads/*.dmg 通配符已移除：expandingTildeInPath 不展开
+            // glob，这些路径永远不会匹配任何文件（属于死条目）。
             return [
                 "~/Library/Application Support/CrashReporter",
                 "~/Library/Caches/com.apple.helpd",
                 "~/Library/Caches/CloudKit",
                 "~/Library/Caches/GeoServices",
-                "~/Library/Caches/com.apple.parsecd",
-                "~/Downloads/*.dmg",
-                "~/Downloads/*.pkg",
-                "~/Downloads/*.zip"
+                "~/Library/Caches/com.apple.parsecd"
             ]
         case .xcodeDerivedData: 
             return [
@@ -315,6 +315,27 @@ class JunkItem: Identifiable, ObservableObject, @unchecked Sendable {
     
     var name: String {
         customName ?? path.lastPathComponent
+    }
+
+    /// User content (Downloads, disk images) is listed for review but never
+    /// auto-selected, and SafetyGuard refuses those protected directories at
+    /// deletion time. Keeping them deselected by default keeps the advertised
+    /// cleanup total equal to what a cleanup can actually remove; an explicit
+    /// user selection may bypass the directory protection (recoverable Trash).
+    static func defaultSelected(for type: JunkType) -> Bool {
+        switch type {
+        case .downloads, .unusedDiskImages: return false
+        default: return true
+        }
+    }
+
+    /// Explicitly user-selected user-content types may bypass directory
+    /// protection, matching the Large Files policy in SmartCleanerService.
+    static func allowsProtectionBypass(for type: JunkType) -> Bool {
+        switch type {
+        case .downloads, .unusedDiskImages: return true
+        default: return false
+        }
     }
 }
 
@@ -554,7 +575,7 @@ class JunkCleaner: ObservableObject {
                 if !typeItems.isEmpty {
                     await MainActor.run {
                         for item in typeItems {
-                            item.isSelected = true
+                            item.isSelected = JunkItem.defaultSelected(for: item.type)
                         }
                         self.junkItems.append(contentsOf: typeItems.filter { ScanResultIgnoreStore.shouldInclude($0.path) })
                     }
@@ -1162,7 +1183,11 @@ class JunkCleaner: ObservableObject {
     /// 删除单个项目并返回删除记录，便于清理结束后真正回收磁盘空间。
     private func deleteItemReturningRecord(_ item: JunkItem) async -> TrashRecord? {
         // ⚠️ 安全修复: 使用SafetyGuard检查
-        if !SafetyGuard.shared.isSafeToDelete(item.path) {
+        // 用户明确勾选的下载项/磁盘映像允许绕过目录保护（仍会移入废纸篓，可恢复）。
+        if !SafetyGuard.shared.isSafeToDelete(
+            item.path,
+            ignoreProtection: JunkItem.allowsProtectionBypass(for: item.type)
+        ) {
             print("[JunkCleaner] 🛡️ SafetyGuard blocked deletion: \(item.path.path)")
             return nil
         }
@@ -1180,7 +1205,11 @@ class JunkCleaner: ObservableObject {
     /// 使用管理员权限清理（通过 AppleScript）
     private func cleanWithAdminPrivileges(paths: [String], items: [JunkItem]) async -> (size: Int64, deletedPaths: Set<String>) {
         let safeItems = items.filter {
-            paths.contains($0.path.path) && SafetyGuard.shared.isSafeToDelete($0.path)
+            paths.contains($0.path.path)
+                && SafetyGuard.shared.isSafeToDelete(
+                    $0.path,
+                    ignoreProtection: JunkItem.allowsProtectionBypass(for: $0.type)
+                )
         }
         if safeItems.isEmpty {
             return (0, [])

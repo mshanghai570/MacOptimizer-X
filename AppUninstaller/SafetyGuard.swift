@@ -413,7 +413,11 @@ class SafetyGuard {
             "tmp", "Tmp", "temp", "Temp",
             "Logs", "logs", "Log", "log",
             "GPUCache", "ShaderCache", "Code Cache",
-            "CachedData", "CachedExtensions"
+            "CachedData", "CachedExtensions",
+            // Electron/Chromium 的 Service Worker 缓存（Slack 等）。
+            "CacheStorage",
+            // 邮件下载附件可从服务器重新下载。
+            "Mail Downloads", "attachments"
         ]
         
         // 1. 检查 ~/Library/Containers/<bundle-id>

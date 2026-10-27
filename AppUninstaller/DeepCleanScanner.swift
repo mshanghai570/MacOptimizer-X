@@ -344,7 +344,9 @@ class DeepCleanScanner: ObservableObject {
                 }
                 
                 // ⚠️ 安全修复: 使用SafetyGuard检查
-                if !SafetyGuard.shared.isSafeToDelete(item.url) {
+                // 大文件是用户在 Documents/Downloads 等受保护目录中明确勾选的内容，
+                // 与 SmartCleanerService 的策略一致：允许绕过目录保护（仍移入废纸篓，可恢复）。
+                if !SafetyGuard.shared.isSafeToDelete(item.url, ignoreProtection: item.category == .largeFiles) {
                     print("[DeepClean] 🛡️ SafetyGuard blocked deletion: \(item.url.path)")
                     categoryFailures.append(item.url)
                     allFailures.append(item.url)
