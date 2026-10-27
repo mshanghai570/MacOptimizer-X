@@ -675,18 +675,23 @@ class SmartCleanerService: ObservableObject {
     /// 删除单个文件
     @MainActor
     func deleteSingleFile(_ file: CleanerFileItem, from category: CleanerCategory) async -> Bool {
-        do {
-            // 使用 FileManager 删除文件
-            try fileManager.removeItem(at: file.url)
-            
-            // 从对应的数组中移除该文件
-            removeFileFromCategory(file, category: category)
-            
-            return true
-        } catch {
-            print("删除文件失败: \(file.url.path) - \(error)")
+        // 缓存/日志类垃圾彻底删除以释放空间，其余移入废纸篓可恢复
+        let regenerable: Set<CleanerCategory> = [.systemJunk, .systemCache, .userCache, .systemLogs, .userLogs, .trash, .oldUpdates]
+        let deleted: Bool
+        if regenerable.contains(category) {
+            // DeletionLogService 内部已有 Trash→直接删除的回退逻辑
+            deleted = DeletionLogService.shared.logAndDelete(at: file.url, category: "SmartClean", permanent: true)
+        } else {
+            deleted = DeletionLogService.shared.logAndDelete(at: file.url, category: "SmartClean")
+        }
+
+        guard deleted else {
+            print("删除文件失败: \(file.url.path)")
             return false
         }
+
+        removeFileFromCategory(file, category: category)
+        return true
     }
     
     /// 从分类数组中移除文件
@@ -2946,10 +2951,10 @@ class SmartCleanerService: ObservableObject {
         var trashedRecords: [TrashRecord] = []
         
         // 辅助函数:安全删除文件
-        func safeDelete(file: CleanerFileItem, bypassProtection: Bool = false) -> Bool {
+        func safeDelete(file: CleanerFileItem, bypassProtection: Bool = false, permanent: Bool = false) -> Bool {
             let url = file.url
             let path = url.path
-            
+
             // ⚠️ 安全修复: 使用SafetyGuard检查
             // 对于大文件清理，如果用户明确选择了，我们允许绕过目录保护 (bypassProtection = true)
             if !SafetyGuard.shared.isSafeToDelete(url, ignoreProtection: bypassProtection) {
@@ -2957,7 +2962,7 @@ class SmartCleanerService: ObservableObject {
                 failedFiles.append(file)
                 return false
             }
-            
+
             // 特殊处理:如果是废纸篓中的文件,可以直接删除
             if path.contains("/.Trash/") || path.hasSuffix("/.Trash") {
                 do {
@@ -2970,16 +2975,25 @@ class SmartCleanerService: ObservableObject {
                     return false
                 }
             }
-            
-            // 1. 检查文件是否可写/可删除
+
+            // 注：不再用 isDeletableFile 提前放弃。该检查在父目录只读或受 TCC
+            // 保护时会误判"不可删除"，而实际 FileManager 仍然可以删除该条目——
+            // 直接交给 DeletionLogService 处理，删除失败时它会记录并允许提权重试。
             if !fileManager.isDeletableFile(atPath: path) {
+                print("[SmartCleaner] ℹ️ isDeletableFile reports false, still attempting: \(path)")
+            }
+
+            // 2. 🛡️ 使用 DeletionLogService 安全删除并记录日志
+            // 可再生的垃圾（permanent=true）彻底删除，立刻释放磁盘空间；
+            // 其他文件移入废纸篓，记录交给 purgeTrashItems 统一回收
+            if permanent {
+                if DeletionLogService.shared.logAndDelete(at: url, category: "SmartClean", permanent: true) {
+                    print("[SmartCleaner] ✅ Permanently removed: \(file.name)")
+                    return true
+                }
                 failedFiles.append(file)
                 return false
-            }
-            
-            // 2. 🛡️ 使用 DeletionLogService 安全删除并记录日志
-            // 这样文件可以从废纸篓恢复到原位置
-            if let record = DeletionLogService.shared.trashAndRecord(at: url, category: "SmartClean") {
+            } else if let record = DeletionLogService.shared.trashAndRecord(at: url, category: "SmartClean") {
                 trashedRecords.append(record)
                 print("[SmartCleaner] ✅ Moved to trash with log: \(file.name)")
                 return true
@@ -2989,7 +3003,7 @@ class SmartCleanerService: ObservableObject {
                 return false
             }
         }
-        
+
         // Reset Real-time Stats
         await MainActor.run {
             self.totalCleanedSize = 0
@@ -3061,27 +3075,19 @@ class SmartCleanerService: ObservableObject {
                cleaningDescription = "Cleaning System Junk..."
            }
            
-            for file in systemJunk {
-                // Only clean selected files
-                guard file.isSelected else { continue }
-                
-                if safeDelete(file: file) {
+           for file in systemJunk {
+               // Only clean selected files
+               guard file.isSelected else { continue }
+
+               if safeDelete(file: file, permanent: true) {
                     totalSize += file.size
                     totalSuccess += 1
                     await MainActor.run { self.totalCleanedSize += file.size }
                 } else { totalFailed += 1 }
             }
-            
-            // Moving caches/logs to the Trash frees nothing on disk — purge what
-            // this stage trashed so the reported "cleaned X" becomes real free
-            // space. Only this run's entries are removed; the user's own Trash
-            // contents are untouched.
-            let purged = DeletionLogService.shared.purgeTrashItems(trashedRecords)
-            print("[SmartCleaner] 🧹 Purged \(purged.count) trashed junk items (\(purged.bytes) bytes) to reclaim space")
-            trashedRecords.removeAll()
 
             await MainActor.run { _ = cleanedCategories.insert(.systemJunk) }
-            try? await Task.sleep(nanoseconds: 500_000_000)
+           try? await Task.sleep(nanoseconds: 500_000_000)
         }
         
 
@@ -3097,7 +3103,7 @@ class SmartCleanerService: ObservableObject {
                 for j in 1..<duplicateGroups[i].files.count { // 保留第一个
                     let file = duplicateGroups[i].files[j]
                     guard file.isSelected else { continue }
-                    if safeDelete(file: file) {
+                    if safeDelete(file: file, permanent: true) {
                         totalSize += file.size
                         totalSuccess += 1
                         await MainActor.run { self.totalCleanedSize += file.size }
@@ -3235,6 +3241,13 @@ class SmartCleanerService: ObservableObject {
         }
 
         // 10. 提权清理失败的文件
+        // 移入废纸篓不会释放空间；把本次清理产生的废纸篓记录统一回收，
+        // 保证界面统计的 "已清理" 大小与用户实际拿回的空闲空间一致。
+        if !trashedRecords.isEmpty {
+            let purged = DeletionLogService.shared.purgeTrashItems(trashedRecords)
+            print("[SmartCleaner] 🧹 Purged \(purged.count) trashed items (\(purged.bytes) bytes) to reclaim space")
+            trashedRecords.removeAll()
+        }
         if !failedFiles.isEmpty {
             var seenFailedPaths = Set<String>()
             failedFiles = failedFiles.filter {

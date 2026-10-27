@@ -237,6 +237,7 @@ enum JunkType: String, CaseIterable, Identifiable {
                 "~/Library/Caches/CloudKit",
                 "~/Library/Caches/GeoServices",
                 "~/Library/Caches/com.apple.parsecd",
+                "~/Library/HTTPStorages",
                 "~/Downloads/*.dmg",
                 "~/Downloads/*.pkg",
                 "~/Downloads/*.zip"
@@ -1166,16 +1167,35 @@ class JunkCleaner: ObservableObject {
             print("[JunkCleaner] 🛡️ SafetyGuard blocked deletion: \(item.path.path)")
             return nil
         }
-        
-        // 🛡️ 使用 DeletionLogService 记录删除日志，支持恢复
-        if let record = DeletionLogService.shared.trashAndRecord(at: item.path, category: "JunkClean") {
-            print("[JunkCleaner] ✅ Moved to trash with log: \(item.path.lastPathComponent)")
-            return record
+
+        let category = "JunkClean"
+        let permanent = permanentlyDeletableTypes.contains(item.type)
+
+        // 可再生的缓存/日志类垃圾彻底删除（跳过废纸篓）以立刻释放磁盘空间；
+        // 用户可见的数据（下载、备份、磁盘镜像等）移入废纸篓可恢复。
+        let record: TrashRecord?
+        if permanent {
+            record = DeletionLogService.shared.permanentDelete(at: item.path, category: category)
+        } else {
+            record = DeletionLogService.shared.trashAndRecord(at: item.path, category: category)
+        }
+
+        if record != nil {
+            print("[JunkCleaner] ✅ Removed: \(item.path.lastPathComponent)")
         } else {
             print("[JunkCleaner] ⚠️ Failed to delete: \(item.path.lastPathComponent)")
-            return nil
         }
+        return record
     }
+
+    /// 这些分类里的内容都是可重新生成的数据（缓存、日志、崩溃报告、临时文件、
+    /// Xcode/包管理器缓存等），直接彻底删除才能立即释放磁盘空间。移入废纸篓
+    /// 不会释放任何空间，反而让"清理后磁盘仍然满"成为常见抱怨。
+    private let permanentlyDeletableTypes: Set<JunkType> = [
+        .userCache, .systemCache, .userLogs, .systemLogs, .browserCache,
+        .appCache, .chatCache, .mailAttachments, .crashReports,
+        .tempFiles, .xcodeDerivedData, .oldUpdates
+    ]
     
     /// 使用管理员权限清理（通过 AppleScript）
     private func cleanWithAdminPrivileges(paths: [String], items: [JunkItem]) async -> (size: Int64, deletedPaths: Set<String>) {

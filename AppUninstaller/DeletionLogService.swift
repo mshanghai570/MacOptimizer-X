@@ -58,26 +58,23 @@ class DeletionLogService: ObservableObject {
     
     // MARK: - 公共 API
     
-    /// 安全删除文件并记录日志（支持从废纸篓恢复）
+    /// 安全删除文件并记录日志。
     /// - Parameters:
     ///   - url: 要删除的文件 URL
     ///   - category: 删除来源类别
+    ///   - permanent: true 时跳过废纸篓直接删除（可再生的缓存/日志类垃圾），
+    ///     false 时移入废纸篓（配合 purgeTrashItems 回收空间）
     /// - Returns: 删除是否成功
     @discardableResult
-    func logAndDelete(at url: URL, category: String = "SmartClean") -> Bool {
-        let normalizedURL = url.standardizedFileURL
-
-        // Scan results can overlap (for example a cache directory and one of its
-        // children) or become stale while a cleanup is running.  Deletion is an
-        // idempotent operation: if the requested path is already gone, the
-        // requested end state has been reached and must not be reported as a
-        // failure or trigger an unnecessary administrator prompt.
-        guard fileManager.fileExists(atPath: normalizedURL.path) else {
-            print("[DeletionLog] ✅ Already removed: \(normalizedURL.path)")
+    func logAndDelete(at url: URL, category: String = "SmartClean", permanent: Bool = false) -> Bool {
+        if permanent {
+            return permanentDelete(at: url, category: category) != nil
+        }
+        guard fileManager.fileExists(atPath: url.standardizedFileURL.path) else {
+            print("[DeletionLog] ✅ Already removed: \(url.standardizedFileURL.path)")
             return true
         }
-
-        return trashAndRecord(at: normalizedURL, category: category) != nil
+        return trashAndRecord(at: url, category: category) != nil
     }
 
     /// Moves the item at `url` to the Trash and returns its log entry.
@@ -112,46 +109,86 @@ class DeletionLogService: ObservableObject {
         } else {
             size = calculateSize(at: normalizedURL)
         }
-        
+
         // 使用 trashItem 并获取废纸篓中的新路径
         var trashURL: NSURL?
         do {
             try fileManager.trashItem(at: normalizedURL, resultingItemURL: &trashURL)
+            guard !fileManager.fileExists(atPath: originalPath) else { return nil }
 
-            // FileManager returning without throwing is normally sufficient, but
-            // explicitly verify the source path so every caller gets trustworthy
-            // success accounting.
-            guard !fileManager.fileExists(atPath: originalPath) else {
-                print("[DeletionLog] ❌ Source still exists after trash operation: \(originalPath)")
-                return nil
-            }
-            
-            let trashPath = trashURL?.path
-            
-            // 创建删除记录
             let record = TrashRecord(
                 originalPath: originalPath,
-                trashPath: trashPath,
-                size: size,
+                trashPath: trashURL?.path,
+                size: max(size, 0),
                 category: category
             )
-            
-            // 添加到内存记录
             DispatchQueue.main.async {
                 self.deletionRecords.append(record)
             }
-            
-            // 保存到日志文件
             saveRecord(record)
-            
-            print("[DeletionLog] ✅ Logged deletion: \(originalPath) -> \(trashPath ?? "unknown")")
             return record
-            
         } catch {
-            print("[DeletionLog] ❌ Failed to delete: \(originalPath) - \(error.localizedDescription)")
-            return nil
+            // Many regenerable cache/log locations cannot be moved to the Trash
+            // (sandbox/TCC restrictions treat them as "protected"), yet the
+            // item itself is deletable. Without this fallback the cleanup
+            // reports failure and the junk is never actually removed. Always
+            // attempt a direct removal before giving up.
+            do {
+                try fileManager.removeItem(at: normalizedURL)
+                guard !fileManager.fileExists(atPath: originalPath) else { return nil }
+                let record = TrashRecord(originalPath: originalPath, trashPath: nil, size: max(size, 0), category: category)
+                DispatchQueue.main.async { self.deletionRecords.append(record) }
+                saveRecord(record)
+                print("[DeletionLog] ✅ Trash unavailable, removed directly: \(originalPath)")
+                return record
+            } catch {
+                print("[DeletionLog] ❌ Failed to delete: \(originalPath) - \(error.localizedDescription)")
+                return nil
+            }
         }
     }
+
+    /// 彻底删除（绕过废纸篓）：仅用于可重新生成的缓存、日志和临时文件。
+    /// 删除失败时会自动退回移入废纸篓，保证垃圾仍然被移走。
+    @discardableResult
+    func permanentDelete(at url: URL, category: String) -> TrashRecord? {
+        let normalizedURL = url.standardizedFileURL
+        let originalPath = normalizedURL.path
+
+        var isDirectory: ObjCBool = false
+        guard fileManager.fileExists(atPath: originalPath, isDirectory: &isDirectory) else {
+            print("[DeletionLog] ✅ Already removed: \(originalPath)")
+            return TrashRecord(originalPath: originalPath, trashPath: nil, size: 0, category: category)
+        }
+
+        let size: Int64 = isDirectory.boolValue
+            ? calculateSize(at: normalizedURL)
+            : ((try? fileManager.attributesOfItem(atPath: originalPath))?[.size] as? NSNumber)?.int64Value ?? 0
+
+        do {
+            try fileManager.removeItem(at: normalizedURL)
+            guard !fileManager.fileExists(atPath: originalPath) else { return nil }
+
+            let record = TrashRecord(
+                originalPath: originalPath,
+                trashPath: nil,
+                size: max(size, 0),
+                category: category
+            )
+            DispatchQueue.main.async {
+                self.deletionRecords.append(record)
+            }
+            saveRecord(record)
+            print("[DeletionLog] ✅ Permanently removed: \(originalPath)")
+            return record
+        } catch {
+            // Direct removal denied - fall back to Trash so the item still gets
+            // moved out of the way and remains recoverable.
+            print("[DeletionLog] ⚠️ Permanent removal failed, falling back to Trash: \(originalPath)")
+            return trashAndRecord(at: url, category: category)
+        }
+    }
+
 
     /// Permanently removes Trash entries that a cleanup run just created, so the
     /// bytes reported as cleaned are really reclaimed. Only the supplied records

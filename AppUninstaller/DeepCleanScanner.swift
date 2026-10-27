@@ -351,14 +351,18 @@ class DeepCleanScanner: ObservableObject {
                     continue
                 }
                 
-                if let record = DeletionLogService.shared.trashAndRecord(at: item.url, category: "DeepClean") {
+                // Junk categories (caches/logs/residuals) are regenerateable:
+                // delete permanently so space is freed immediately, bypassing
+                // the Trash entirely. Large files are user content and stay
+                // recoverable in the Trash.
+                if DeletionLogService.shared.logAndDelete(
+                    at: item.url,
+                    category: "DeepClean",
+                    permanent: item.category != .largeFiles
+                ) {
                     totalDeletedCount += 1
                     totalDeletedSize += item.size
-                    if category != .largeFiles {
-                        trashedJunkRecords.append(record)
-                    }
                 } else {
-                    print("Delete failed for \(item.url)")
                     categoryFailures.append(item.url)
                     allFailures.append(item.url)
                     permissionRetryItems.append(item)
@@ -1240,6 +1244,8 @@ class DeepCleanScanner: ObservableObject {
             return false
         }
         
+        // Keep the main-branch Trash-empties shortcut first, then the
+        // permanent/trash delete, then the privileged retry as last resort.
         let trashURL = fileManager.homeDirectoryForCurrentUser.appendingPathComponent(".Trash")
         if item.url.standardizedFileURL.path == trashURL.standardizedFileURL.path {
             let (emptiedCount, emptiedSize) = await Self.emptyTrashContents(at: trashURL)
@@ -1249,7 +1255,11 @@ class DeepCleanScanner: ObservableObject {
             return true
         }
 
-        if DeletionLogService.shared.logAndDelete(at: item.url, category: "DeepClean") {
+        if DeletionLogService.shared.logAndDelete(
+            at: item.url,
+            category: "DeepClean",
+            permanent: item.category != .largeFiles
+        ) {
             items.removeAll { $0.id == item.id }
             totalSize = max(0, totalSize - item.size)
             return true
