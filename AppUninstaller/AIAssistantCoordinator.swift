@@ -1049,8 +1049,11 @@ final class AIAssistantCoordinator: ObservableObject {
 
     private func providerFailureMessage(_ error: Error) -> String {
         let detail: String
-        if case let AIProviderError.httpStatus(code) = error {
-            detail = providerFailureDetail(code)
+        if case let AIProviderError.httpStatus(code, message) = error {
+            let providerDetail = providerFailureDetail(code)
+            detail = message.map { "\(providerDetail): \($0)" } ?? providerDetail
+        } else if case let AIProviderError.transport(message) = error {
+            detail = message
         } else {
             detail = localized([.chinese: "请求或响应格式无效", .traditionalChinese: "要求或回應格式無效", .english: "invalid request or response format", .japanese: "リクエストまたは応答形式が無効です", .korean: "요청 또는 응답 형식이 올바르지 않음", .russian: "недопустимый формат запроса или ответа"])
         }

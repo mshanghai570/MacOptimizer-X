@@ -421,6 +421,10 @@ struct AIAssistantSettingsView: View {
     @State private var statusMessage = ""
     @State private var statusIsError = false
     @State private var isTesting = false
+    @State private var availableModels: [String] = []
+    @State private var isLoadingModels = false
+    @State private var modelLoadMessage = ""
+    @State private var modelLoadTask: Task<Void, Never>?
 
     var body: some View {
         ScrollView {
@@ -441,7 +445,10 @@ struct AIAssistantSettingsView: View {
                     }
                 }
                 .pickerStyle(.segmented)
-                .onChange(of: selectedProvider) { provider in load(provider) }
+                .onChange(of: selectedProvider) { provider in
+                    load(provider)
+                    scheduleModelDiscovery()
+                }
 
                 settingsField(
                     title: "Base URL",
@@ -459,11 +466,44 @@ struct AIAssistantSettingsView: View {
                     title: t("模型", "模型", "Model", "モデル", "모델", "Модель"),
                     detail: t("模型名称会原样发送，不限制服务商或中转命名", "模型名稱會原樣傳送，不限制服務商或中轉命名", "The model name is sent unchanged; provider and gateway naming are not restricted", "モデル名は変更せず送信され、プロバイダーやゲートウェイの命名を制限しません", "모델 이름은 그대로 전송되며 제공업체나 게이트웨이 이름을 제한하지 않습니다", "Имя модели передаётся без изменений; названия поставщиков и шлюзов не ограничиваются"),
                     content: AnyView(
-                        TextField(selectedProvider.defaultModel, text: $model)
-                            .textFieldStyle(.plain)
-                            .padding(.horizontal, 12)
-                            .frame(height: 34)
-                            .background(settingsInputBackground)
+                        VStack(alignment: .leading, spacing: 8) {
+                            TextField(selectedProvider.defaultModel, text: $model)
+                                .textFieldStyle(.plain)
+                                .padding(.horizontal, 12)
+                                .frame(height: 34)
+                                .background(settingsInputBackground)
+
+                            if selectedProvider == .openAI {
+                                HStack(spacing: 10) {
+                                    if !availableModels.isEmpty {
+                                        Picker(t("可用模型", "可用模型", "Available Models", "利用可能なモデル", "사용 가능한 모델", "Доступные модели"), selection: $model) {
+                                            ForEach(availableModels, id: \.self) { identifier in
+                                                Text(identifier).tag(identifier)
+                                            }
+                                        }
+                                        .pickerStyle(.menu)
+                                    }
+
+                                    Button {
+                                        modelLoadTask?.cancel()
+                                        modelLoadTask = Task { await loadAvailableModels() }
+                                    } label: {
+                                        HStack(spacing: 5) {
+                                            if isLoadingModels { ProgressView().controlSize(.small) }
+                                            Text(t("加载模型", "載入模型", "Load Models", "モデルを読み込む", "모델 불러오기", "Загрузить модели"))
+                                        }
+                                    }
+                                    .buttonStyle(.bordered)
+                                    .disabled(isLoadingModels || !canDiscoverModels)
+                                }
+
+                                if !modelLoadMessage.isEmpty {
+                                    Text(modelLoadMessage)
+                                        .font(.system(size: 10.5))
+                                        .foregroundColor(availableModels.isEmpty ? .orange : .green)
+                                }
+                            }
+                        }
                     )
                 )
 
@@ -514,7 +554,13 @@ struct AIAssistantSettingsView: View {
             .padding(.horizontal, 24)
             .padding(.vertical, 20)
         }
-        .onAppear { load(selectedProvider) }
+        .onAppear {
+            load(selectedProvider)
+            scheduleModelDiscovery()
+        }
+        .onChange(of: baseURL) { _ in scheduleModelDiscovery() }
+        .onChange(of: apiKey) { _ in scheduleModelDiscovery() }
+        .onDisappear { modelLoadTask?.cancel() }
     }
 
     private var zaomengPromotionCard: some View {
@@ -589,11 +635,63 @@ struct AIAssistantSettingsView: View {
     }
 
     private func load(_ provider: AIProvider) {
+        modelLoadTask?.cancel()
+        availableModels = []
+        modelLoadMessage = ""
         let configuration = store.configuration(for: provider)
         baseURL = configuration.baseURL
         apiKey = configuration.apiKey
         model = configuration.model
         statusMessage = ""
+    }
+
+    private var canDiscoverModels: Bool {
+        guard selectedProvider == .openAI,
+              !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              let components = URLComponents(string: baseURL.trimmingCharacters(in: .whitespacesAndNewlines)),
+              components.host != nil else { return false }
+        return components.scheme == "https" || components.scheme == "http"
+    }
+
+    private func scheduleModelDiscovery() {
+        modelLoadTask?.cancel()
+        guard canDiscoverModels else {
+            availableModels = []
+            modelLoadMessage = ""
+            return
+        }
+        modelLoadTask = Task {
+            try? await Task.sleep(nanoseconds: 700_000_000)
+            guard !Task.isCancelled else { return }
+            await loadAvailableModels()
+        }
+    }
+
+    private func loadAvailableModels() async {
+        guard canDiscoverModels else { return }
+        isLoadingModels = true
+        modelLoadMessage = ""
+        defer { isLoadingModels = false }
+        do {
+            let loaded = try await AIProviderClient().listOpenAICompatibleModels(
+                baseURL: baseURL,
+                apiKey: apiKey
+            )
+            guard !Task.isCancelled else { return }
+            availableModels = loaded
+            if model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+               let first = loaded.first {
+                model = first
+            }
+            modelLoadMessage = String(
+                format: t("已加载 %d 个模型", "已載入 %d 個模型", "Loaded %d models", "%d件のモデルを読み込みました", "%d개 모델을 불러왔습니다", "Загружено моделей: %d"),
+                loaded.count
+            )
+        } catch {
+            guard !Task.isCancelled else { return }
+            availableModels = []
+            modelLoadMessage = error.localizedDescription
+        }
     }
 
     private func save() {
@@ -615,22 +713,42 @@ struct AIAssistantSettingsView: View {
         defer { isTesting = false }
         do {
             try store.save(provider: selectedProvider, baseURL: baseURL, apiKey: apiKey, model: model)
-            _ = try await AIProviderClient().generateJSON(
+            let response = try await AIProviderClient().generateJSON(
                 configuration: store.configuration(for: selectedProvider),
                 systemPrompt: "Return JSON only.",
                 userPrompt: "Return exactly {\"status\":\"ok\"}."
             )
+            guard connectionTestSucceeded(response) else {
+                throw AIProviderError.invalidResponse
+            }
             statusIsError = false
             statusMessage = t("连接成功，Mac 优化智能体已可使用", "連線成功，Mac 最佳化智慧代理已可使用", "Connection successful. Mac Optimization Agent is ready.", "接続に成功しました。Mac最適化エージェントを使用できます。", "연결되었습니다. Mac 최적화 에이전트를 사용할 수 있습니다.", "Подключение выполнено. Агент оптимизации Mac готов к работе.")
             onSaved?()
         } catch {
             statusIsError = true
-            if case let AIProviderError.httpStatus(code) = error {
+            if case let AIProviderError.httpStatus(code, message) = error {
                 statusMessage = httpFailureMessage(code)
+                if let message, !message.isEmpty {
+                    statusMessage += "\n\(message)"
+                }
             } else {
-                statusMessage = t("连接失败，请检查地址、模型和密钥", "連線失敗，請檢查位址、模型與金鑰", "Connection failed. Check the endpoint, model, and key.", "接続に失敗しました。エンドポイント、モデル、キーを確認してください。", "연결에 실패했습니다. 주소, 모델 및 키를 확인하세요.", "Ошибка подключения. Проверьте адрес, модель и ключ.")
+                statusMessage = error.localizedDescription
             }
         }
+    }
+
+    private func connectionTestSucceeded(_ response: String) -> Bool {
+        let stripped = response
+            .replacingOccurrences(of: "```json", with: "", options: .caseInsensitive)
+            .replacingOccurrences(of: "```", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let start = stripped.firstIndex(of: "{"),
+              let end = stripped.lastIndex(of: "}"),
+              start <= end,
+              let data = String(stripped[start...end]).data(using: .utf8),
+              let value = try? JSONSerialization.jsonObject(with: data),
+              let object = value as? [String: Any] else { return false }
+        return (object["status"] as? String)?.lowercased() == "ok"
     }
 
     private func httpFailureMessage(_ code: Int) -> String {

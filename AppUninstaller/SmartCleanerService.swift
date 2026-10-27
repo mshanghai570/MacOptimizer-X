@@ -675,18 +675,23 @@ class SmartCleanerService: ObservableObject {
     /// 删除单个文件
     @MainActor
     func deleteSingleFile(_ file: CleanerFileItem, from category: CleanerCategory) async -> Bool {
-        do {
-            // 使用 FileManager 删除文件
-            try fileManager.removeItem(at: file.url)
-            
-            // 从对应的数组中移除该文件
-            removeFileFromCategory(file, category: category)
-            
-            return true
-        } catch {
-            print("删除文件失败: \(file.url.path) - \(error)")
+        // 缓存/日志类垃圾彻底删除以释放空间，其余移入废纸篓可恢复
+        let regenerable: Set<CleanerCategory> = [.systemJunk, .systemCache, .userCache, .systemLogs, .userLogs, .trash, .oldUpdates]
+        let deleted: Bool
+        if regenerable.contains(category) {
+            // DeletionLogService 内部已有 Trash→直接删除的回退逻辑
+            deleted = DeletionLogService.shared.logAndDelete(at: file.url, category: "SmartClean", permanent: true)
+        } else {
+            deleted = DeletionLogService.shared.logAndDelete(at: file.url, category: "SmartClean")
+        }
+
+        guard deleted else {
+            print("删除文件失败: \(file.url.path)")
             return false
         }
+
+        removeFileFromCategory(file, category: category)
+        return true
     }
     
     /// 从分类数组中移除文件
@@ -2889,10 +2894,10 @@ class SmartCleanerService: ObservableObject {
         var failedFiles: [CleanerFileItem] = []
         
         // 辅助函数:安全删除文件
-        func safeDelete(file: CleanerFileItem, bypassProtection: Bool = false) -> Bool {
+        func safeDelete(file: CleanerFileItem, bypassProtection: Bool = false, permanent: Bool = false) -> Bool {
             let url = file.url
             let path = url.path
-            
+
             // ⚠️ 安全修复: 使用SafetyGuard检查
             // 对于大文件清理，如果用户明确选择了，我们允许绕过目录保护 (bypassProtection = true)
             if !SafetyGuard.shared.isSafeToDelete(url, ignoreProtection: bypassProtection) {
@@ -2900,7 +2905,7 @@ class SmartCleanerService: ObservableObject {
                 failedFiles.append(file)
                 return false
             }
-            
+
             // 特殊处理:如果是废纸篓中的文件,可以直接删除
             if path.contains("/.Trash/") || path.hasSuffix("/.Trash") {
                 do {
@@ -2913,17 +2918,19 @@ class SmartCleanerService: ObservableObject {
                     return false
                 }
             }
-            
-            // 1. 检查文件是否可写/可删除
+
+            // 注：不再用 isDeletableFile 提前放弃。该检查在父目录只读或受 TCC
+            // 保护时会误判"不可删除"，而实际 FileManager 仍然可以删除该条目——
+            // 直接交给 DeletionLogService 处理，删除失败时它会记录并允许提权重试。
             if !fileManager.isDeletableFile(atPath: path) {
-                failedFiles.append(file)
-                return false
+                print("[SmartCleaner] ℹ️ isDeletableFile reports false, still attempting: \(path)")
             }
-            
+
             // 2. 🛡️ 使用 DeletionLogService 安全删除并记录日志
-            // 这样文件可以从废纸篓恢复到原位置
-            if DeletionLogService.shared.logAndDelete(at: url, category: "SmartClean") {
-                print("[SmartCleaner] ✅ Moved to trash with log: \(file.name)")
+            // 可再生的缓存/日志类垃圾彻底删除以立刻释放磁盘空间；
+            // 其他文件移入废纸篓，可从废纸篓恢复到原位置
+            if DeletionLogService.shared.logAndDelete(at: url, category: "SmartClean", permanent: permanent) {
+                print("[SmartCleaner] ✅ Deleted: \(file.name)")
                 return true
             } else {
                 print("[SmartCleaner] ⚠️ Failed to delete: \(file.name)")
@@ -2932,45 +2939,6 @@ class SmartCleanerService: ObservableObject {
             }
         }
         
-        // 1. 清理系统垃圾
-        await MainActor.run {
-            cleaningCurrentCategory = .systemJunk
-            cleaningDescription = "Cleaning System Junk..."
-        }
-        
-        // 执行各子步骤清理...
-        // 用户缓存 (包括散项和按应用分组的项目)
-        for file in userCacheFiles where file.isSelected {
-            if safeDelete(file: file) {
-                totalSize += file.size
-                totalSuccess += 1
-            } else { totalFailed += 1 }
-        }
-        
-        for group in appCacheGroups {
-            for file in group.files where file.isSelected {
-                if safeDelete(file: file) {
-                    totalSize += file.size
-                    totalSuccess += 1
-                } else { totalFailed += 1 }
-            }
-        }
-        
-        // 系统缓存
-        // ⚠️ 严重 BUG 修复：添加 isSelected 检查
-        for file in systemCacheFiles where file.isSelected {
-            if safeDelete(file: file) {
-                totalSize += file.size
-                totalSuccess += 1
-            } else { totalFailed += 1 }
-        }
-        
-        // 旧更新
-        // ⚠️ 严重 BUG 修复：添加 isSelected 检查
-
-        
-        // 日志
-        // ⚠️ 严重 BUG 修复：添加 isSelected 检查
         // Reset Real-time Stats
         await MainActor.run {
             self.totalCleanedSize = 0
@@ -2979,7 +2947,12 @@ class SmartCleanerService: ObservableObject {
         }
         
         // 1. 清理系统垃圾 (System Junk + User Cache)
-        let systemJunk = systemCacheFiles + userCacheFiles + oldUpdateFiles + systemLogFiles + userLogFiles
+        let allSystemJunk = systemCacheFiles + userCacheFiles + oldUpdateFiles
+            + systemLogFiles + userLogFiles + appCacheGroups.flatMap(\.files)
+        var seenSystemJunkPaths = Set<String>()
+        let systemJunk = allSystemJunk.filter {
+            seenSystemJunkPaths.insert($0.url.standardizedFileURL.path).inserted
+        }
         if !systemJunk.isEmpty {
            await MainActor.run { 
                cleaningCurrentCategory = .systemJunk 
@@ -2990,14 +2963,14 @@ class SmartCleanerService: ObservableObject {
                // Only clean selected files
                guard file.isSelected else { continue }
                
-               if safeDelete(file: file) {
-                   totalSize += file.size
-                   totalSuccess += 1
-                   await MainActor.run { self.totalCleanedSize += file.size }
-               } else { totalFailed += 1 }
-           }
-           
-           await MainActor.run { _ = cleanedCategories.insert(.systemJunk) }
+               if safeDelete(file: file, permanent: true) {
+                    totalSize += file.size
+                    totalSuccess += 1
+                    await MainActor.run { self.totalCleanedSize += file.size }
+                } else { totalFailed += 1 }
+            }
+
+            await MainActor.run { _ = cleanedCategories.insert(.systemJunk) }
            try? await Task.sleep(nanoseconds: 500_000_000)
         }
         
@@ -3014,7 +2987,7 @@ class SmartCleanerService: ObservableObject {
                 for j in 1..<duplicateGroups[i].files.count { // 保留第一个
                     let file = duplicateGroups[i].files[j]
                     guard file.isSelected else { continue }
-                    if safeDelete(file: file) {
+                    if safeDelete(file: file, permanent: true) {
                         totalSize += file.size
                         totalSuccess += 1
                         await MainActor.run { self.totalCleanedSize += file.size }
@@ -3153,10 +3126,14 @@ class SmartCleanerService: ObservableObject {
 
         // 10. 提权清理失败的文件
         if !failedFiles.isEmpty {
+            var seenFailedPaths = Set<String>()
+            failedFiles = failedFiles.filter {
+                seenFailedPaths.insert($0.url.standardizedFileURL.path).inserted
+            }
             let (sudoSuccess, _, sudoSize) = await cleanWithPrivileges(files: failedFiles)
             totalSuccess += sudoSuccess
             // 如果提权删除成功，原来的 totalFailed 需要减去这些成功的
-            totalFailed -= sudoSuccess 
+            totalFailed = max(0, totalFailed - sudoSuccess)
             totalSize += sudoSize
             
             // 更新 failedFiles 列表，移除那些已成功删除的
@@ -3175,11 +3152,15 @@ class SmartCleanerService: ObservableObject {
             // 只移除成功的，保留失败的
             let failedSet = Set(failedFiles.map(\.url))
             
-            userCacheFiles = userCacheFiles.filter { failedSet.contains($0.url) }
-            systemCacheFiles = systemCacheFiles.filter { failedSet.contains($0.url) }
-            oldUpdateFiles = oldUpdateFiles.filter { failedSet.contains($0.url) }
-            systemLogFiles = systemLogFiles.filter { failedSet.contains($0.url) }
-            userLogFiles = userLogFiles.filter { failedSet.contains($0.url) }
+            userCacheFiles = userCacheFiles.filter { failedSet.contains($0.url) || !$0.isSelected }
+            systemCacheFiles = systemCacheFiles.filter { failedSet.contains($0.url) || !$0.isSelected }
+            oldUpdateFiles = oldUpdateFiles.filter { failedSet.contains($0.url) || !$0.isSelected }
+            systemLogFiles = systemLogFiles.filter { failedSet.contains($0.url) || !$0.isSelected }
+            userLogFiles = userLogFiles.filter { failedSet.contains($0.url) || !$0.isSelected }
+            for group in appCacheGroups {
+                group.files = group.files.filter { failedSet.contains($0.url) || !$0.isSelected }
+            }
+            appCacheGroups.removeAll { $0.files.isEmpty }
             
             // 对于 duplicateGroups 和 similarPhotoGroups，重新扫描比较好，因为结构变了
             // 这里简单处理：如果某个文件还在，就保留它
@@ -3261,64 +3242,33 @@ class SmartCleanerService: ObservableObject {
             Task { @MainActor in isCleaning = false }
         }
         
-        var totalSuccess = 0
-        var totalFailed = 0
-        var totalSize: Int64 = 0
-        
-        // 1. 创建临时脚本文件
-        let scriptContent = files.map { file in
-            // 使用引号包裹路径以处理空格
-            let escapedPath = file.url.path.replacingOccurrences(of: "\"", with: "\\\"")
-            // rm -rf "path" || true (忽略错误继续执行)
-            return "rm -rf \"\(escapedPath)\" || true"
-        }.joined(separator: "\n")
-        
-        // 添加 exit 0 确保脚本总是成功返回，避免 AppleScript 报错
-        let fullScript = "#!/bin/bash\n" + scriptContent + "\nexit 0"
-        
-        let tempScriptURL = fileManager.temporaryDirectory.appendingPathComponent("cleaner_script_\(UUID().uuidString).sh")
-        
-        do {
-            try fullScript.write(to: tempScriptURL, atomically: true, encoding: .utf8)
-            // 赋予执行权限
-            try fileManager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: tempScriptURL.path)
-            
-            // 2. 使用管理员权限执行该脚本
-            // 注意：我们这里只请求一次权限
-            let appleScriptCommand = "do shell script \"/bin/bash \(tempScriptURL.path)\" with administrator privileges"
-            
-            var error: NSDictionary?
-            if let appleScript = NSAppleScript(source: appleScriptCommand) {
-                appleScript.executeAndReturnError(&error)
-                
-                if error == nil {
-                    // 假设脚本执行完成后，我们需要验证哪些文件实际上被删除了
-                    for file in files {
-                        if !fileManager.fileExists(atPath: file.url.path) {
-                            totalSuccess += 1
-                            totalSize += file.size
-                        } else {
-                            totalFailed += 1
-                        }
-                    }
-                } else {
-                    // 脚本执行失败（可能是用户取消了授权）
-                    totalFailed = files.count
-                    print("Admin script error: \(String(describing: error))")
-                }
-            } else {
-                totalFailed = files.count
-            }
-            
-            // 3. 清理临时脚本
-            try? fileManager.removeItem(at: tempScriptURL)
-            
-        } catch {
-            print("Failed to create temp script: \(error)")
-            totalFailed = files.count
+        let selectedLargeFilePaths: [String] = largeFiles
+            .filter { $0.isSelected }
+            .map { $0.url.standardizedFileURL.path }
+        let selectedDuplicatePaths: [String] = duplicateGroups.flatMap { group in
+            group.files.filter { $0.isSelected }.map { $0.url.standardizedFileURL.path }
         }
-        
-        return (totalSuccess, totalFailed, totalSize)
+        let selectedSimilarPhotoPaths: [String] = similarPhotoGroups.flatMap { group in
+            group.files.filter { $0.isSelected }.map { $0.url.standardizedFileURL.path }
+        }
+        let explicitUserPaths: Set<String> = Set(
+            selectedLargeFilePaths + selectedDuplicatePaths + selectedSimilarPhotoPaths
+        )
+        let safeFiles = files.filter { file in
+            SafetyGuard.shared.isSafeToDelete(
+                file.url,
+                ignoreProtection: explicitUserPaths.contains(file.url.standardizedFileURL.path)
+            )
+        }
+        let safeURLs: [URL] = safeFiles.map { $0.url }
+        let results = await FileRemover().removeItemsWithPrivilege(paths: safeURLs)
+        var totalSuccess = 0
+        var totalSize: Int64 = 0
+        for (index, file) in safeFiles.enumerated() where index < results.count && results[index] {
+            totalSuccess += 1
+            totalSize += file.size
+        }
+        return (totalSuccess, files.count - totalSuccess, totalSize)
     }
     
     // MARK: - 全选/取消全选

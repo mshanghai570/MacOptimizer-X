@@ -56,6 +56,8 @@ enum AIProviderClientVerifier {
             try require(request.value(forHTTPHeaderField: "Authorization") == "Bearer openai-secret", "OpenAI authorization header mismatch")
             let body = try jsonBody(request)
             try require(body["model"] as? String == "openai-test", "OpenAI model mismatch")
+            let responseFormat = body["response_format"] as? [String: Any]
+            try require(responseFormat?["type"] as? String == "json_object", "OpenAI JSON response format missing")
             let messages = body["messages"] as? [[String: Any]]
             let content = messages?.last?["content"] as? [[String: Any]]
             let imageURL = (content?.last?["image_url"] as? [String: Any])?["url"] as? String
@@ -68,12 +70,29 @@ enum AIProviderClientVerifier {
         }
 
         let result = try await client.generateJSON(
-            configuration: .init(provider: .openAI, baseURL: "https://example.test/v1", apiKey: "openai-secret", model: "openai-test"),
+            configuration: .init(provider: .openAI, baseURL: "https://api.openai.com/v1", apiKey: "openai-secret", model: "openai-test"),
             systemPrompt: "system",
             userPrompt: "user",
             attachments: [.init(data: Data([1, 2, 3]), mimeType: "image/png")]
         )
         try require(result.contains("ok"), "OpenAI response parsing failed")
+
+        MockURLProtocol.handler = { request in
+            try require(request.httpMethod == "GET", "OpenAI model listing must use GET")
+            try require(request.url?.path == "/v1/models", "OpenAI models endpoint path mismatch")
+            try require(request.value(forHTTPHeaderField: "Authorization") == "Bearer openai-secret", "OpenAI models authorization header mismatch")
+            let response = try response(for: request)
+            let data = try JSONSerialization.data(withJSONObject: [
+                "object": "list",
+                "data": [["id": "z-model"], ["id": "a-model"], ["id": "a-model"]]
+            ])
+            return (response, data)
+        }
+        let models = try await client.listOpenAICompatibleModels(
+            baseURL: "https://api.openai.com/v1",
+            apiKey: "openai-secret"
+        )
+        try require(models == ["a-model", "z-model"], "OpenAI model listing parsing failed")
     }
 
     private static func verifyGemini(_ client: AIProviderClient) async throws {

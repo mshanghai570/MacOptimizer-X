@@ -166,8 +166,12 @@ class DeepCleanScanner: ObservableObject {
             // Update Results
              let visibleItems = newItems.filter { ScanResultIgnoreStore.shouldInclude($0.url) }
              await MainActor.run {
-                self.items.append(contentsOf: visibleItems)
-                self.totalSize += visibleItems.reduce(0) { $0 + $1.size }
+                var seenPaths = Set(self.items.map { $0.url.standardizedFileURL.path })
+                let uniqueItems = visibleItems.filter {
+                    seenPaths.insert($0.url.standardizedFileURL.path).inserted
+                }
+                self.items.append(contentsOf: uniqueItems)
+                self.totalSize += uniqueItems.reduce(0) { $0 + $1.size }
                 self.completedCategories.insert(category)
                 self.items.sort { $0.size > $1.size } // Keep sorted
                 
@@ -283,6 +287,7 @@ class DeepCleanScanner: ObservableObject {
         }
         
         let totalCategories = Double(categoriesWithSelection.count)
+        let privilegedRemover = FileRemover()
         
         for (index, category) in categoriesWithSelection.enumerated() {
             print("[DeepClean] 🔄 开始清理分类: \(category.localizedName)")
@@ -311,6 +316,7 @@ class DeepCleanScanner: ObservableObject {
             let categoryItems = items.filter { $0.category == category && $0.isSelected }
             print("[DeepClean] 📦 该分类有 \(categoryItems.count) 个项目需要清理")
             var categoryFailures: [URL] = []
+            var permissionRetryItems: [DeepCleanItem] = []
             
             for item in categoryItems {
                 // ⚠️ 安全修复: 使用SafetyGuard检查
@@ -321,14 +327,35 @@ class DeepCleanScanner: ObservableObject {
                     continue
                 }
                 
-                do {
-                    try fileManager.trashItem(at: item.url, resultingItemURL: nil)
+                if DeletionLogService.shared.logAndDelete(
+                    at: item.url,
+                    category: "DeepClean",
+                    permanent: item.category != .largeFiles
+                ) {
                     totalDeletedCount += 1
                     totalDeletedSize += item.size
-                } catch {
-                    print("Delete failed for \(item.url): \(error.localizedDescription)")
+                } else {
+                    print("Delete failed for \(item.url)")
                     categoryFailures.append(item.url)
                     allFailures.append(item.url)
+                    permissionRetryItems.append(item)
+                }
+            }
+
+            // Trash may reject protected-but-safe cache/log locations. Retry the
+            // actual failures in one administrator request, then verify each path
+            // independently before updating counts or the UI.
+            if !permissionRetryItems.isEmpty {
+                let retryResults = await privilegedRemover.removeItemsWithPrivilege(
+                    paths: permissionRetryItems.map(\.url)
+                )
+                for (retryIndex, item) in permissionRetryItems.enumerated() {
+                    if retryIndex < retryResults.count && retryResults[retryIndex] {
+                        totalDeletedCount += 1
+                        totalDeletedSize += item.size
+                        categoryFailures.removeAll { $0.standardizedFileURL == item.url.standardizedFileURL }
+                        allFailures.removeAll { $0.standardizedFileURL == item.url.standardizedFileURL }
+                    }
                 }
             }
             
@@ -1158,15 +1185,21 @@ class DeepCleanScanner: ObservableObject {
             return false
         }
         
-        do {
-            // ⚠️ 安全改进：使用 trashItem 替代 removeItem，支持从废纸篓恢复
-            try fileManager.trashItem(at: item.url, resultingItemURL: nil)
+        if DeletionLogService.shared.logAndDelete(
+            at: item.url,
+            category: "DeepClean",
+            permanent: item.category != .largeFiles
+        ) {
             items.removeAll { $0.id == item.id }
-            totalSize -= item.size
+            totalSize = max(0, totalSize - item.size)
             return true
-        } catch {
-            print("删除失败: \(item.url.path) - \(error)")
-            return false
         }
+
+        let removed = await FileRemover().removeItemWithPrivilege(at: item.url)
+        if removed {
+            items.removeAll { $0.id == item.id }
+            totalSize = max(0, totalSize - item.size)
+        }
+        return removed
     }
 }
