@@ -19,8 +19,10 @@ struct CleanMyMacDetailsOverlay: View {
         case name
     }
 
+    // Includes trash and downloads/updates so the System Junk root total in
+    // the details panel matches the aggregate size shown on the summary tab.
     private let systemCategories: [CleanerCategory] = [
-        .systemCache, .userCache, .userLogs, .systemLogs
+        .systemCache, .userCache, .userLogs, .systemLogs, .oldUpdates, .trash
     ]
 
     @State private var selectedRoot: RootCategory

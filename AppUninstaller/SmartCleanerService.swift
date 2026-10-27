@@ -1008,7 +1008,26 @@ class SmartCleanerService: ObservableObject {
         // 3. 扫描用户缓存
         await updateProgress(step: currentStep, total: totalSteps, message: "正在扫描用户缓存...")
         let usrCache = await scanUserCache()
-        await MainActor.run { userCacheFiles = visible(usrCache) }
+        // ~/Library/Caches is enumerated by both the system-cache pass and
+        // the user-cache pass; publish each folder once so the aggregated
+        // System Junk total cannot double-count the same directory.
+        let systemCachePaths = Set(sysCache.map { $0.url.standardizedFileURL.path })
+        let dedupedUserCache = usrCache.filter { !systemCachePaths.contains($0.url.standardizedFileURL.path) }
+        await MainActor.run {
+            userCacheFiles = visible(dedupedUserCache)
+            // scanSystemCache also adds ~/Library/Caches/* folders (Apple and
+            // developer caches) while scanUserCache groups the same folders by
+            // app. systemJunkTotalSize sums systemCacheFiles AND appCacheGroups,
+            // so an un-deduplicated folder was counted twice — the advertised
+            // total was roughly double what cleanup could ever delete.
+            // Keep exactly one owner per path.
+            let ownedPaths = Set(systemCacheFiles.map { $0.url.standardizedFileURL.path })
+                .union(userCacheFiles.map { $0.url.standardizedFileURL.path })
+            for group in appCacheGroups {
+                group.files.removeAll { ownedPaths.contains($0.url.standardizedFileURL.path) }
+            }
+            appCacheGroups.removeAll { $0.files.isEmpty }
+        }
         currentStep += 1
         
         // 3.5 扫描废纸篓
@@ -1687,6 +1706,14 @@ class SmartCleanerService: ObservableObject {
         }
         
         // 9. 更新服务状态
+        // Explicit developer-cache entries can repeat folders already listed
+        // in the loose-items path; publish each path once.
+        var seenItemPaths = Set<String>()
+        items = items.filter { seenItemPaths.insert($0.url.standardizedFileURL.path).inserted }
+        for group in groupsMap.values {
+            var seenInGroup = Set<String>()
+            group.files.removeAll { !seenInGroup.insert($0.url.standardizedFileURL.path).inserted }
+        }
         let finalGroups = Array(groupsMap.values).sorted { $0.totalSize > $1.totalSize }
         await MainActor.run {
             self.appCacheGroups = finalGroups
@@ -2669,6 +2696,32 @@ class SmartCleanerService: ObservableObject {
         return totalSize
     }
     
+    /// Size of a single file or a recursively-visited directory tree.
+    /// Safe to call from detached tasks and other agents (no instance state).
+    private static func recursiveSize(of url: URL) -> Int64 {
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) else { return 0 }
+        
+        if !isDirectory.boolValue {
+            return Int64((try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
+        }
+        
+        var totalSize: Int64 = 0
+        guard let enumerator = FileManager.default.enumerator(
+            at: url,
+            includingPropertiesForKeys: [.fileSizeKey],
+            options: [],
+            errorHandler: { _, _ in true }
+        ) else { return 0 }
+        
+        for case let fileURL as URL in enumerator {
+            if let size = try? fileURL.resourceValues(forKeys: [.fileSizeKey]).fileSize {
+                totalSize += Int64(size)
+            }
+        }
+        return totalSize
+    }
+    
     // MARK: - 统计
     
     func selectedCount(for category: CleanerCategory) -> Int {
@@ -2892,6 +2945,10 @@ class SmartCleanerService: ObservableObject {
         var totalFailed = 0
         var totalSize: Int64 = 0
         var failedFiles: [CleanerFileItem] = []
+        // Every item this run moves to the Trash, so the junk it just cleaned
+        // can be permanently purged afterwards. Trashing alone frees no disk
+        // space, which is why "cleaned X" never matched the space users got back.
+        var trashedRecords: [TrashRecord] = []
         
         // 辅助函数:安全删除文件
         func safeDelete(file: CleanerFileItem, bypassProtection: Bool = false, permanent: Bool = false) -> Bool {
@@ -2927,10 +2984,18 @@ class SmartCleanerService: ObservableObject {
             }
 
             // 2. 🛡️ 使用 DeletionLogService 安全删除并记录日志
-            // 可再生的缓存/日志类垃圾彻底删除以立刻释放磁盘空间；
-            // 其他文件移入废纸篓，可从废纸篓恢复到原位置
-            if DeletionLogService.shared.logAndDelete(at: url, category: "SmartClean", permanent: permanent) {
-                print("[SmartCleaner] ✅ Deleted: \(file.name)")
+            // 可再生的垃圾（permanent=true）彻底删除，立刻释放磁盘空间；
+            // 其他文件移入废纸篓，记录交给 purgeTrashItems 统一回收
+            if permanent {
+                if DeletionLogService.shared.logAndDelete(at: url, category: "SmartClean", permanent: true) {
+                    print("[SmartCleaner] ✅ Permanently removed: \(file.name)")
+                    return true
+                }
+                failedFiles.append(file)
+                return false
+            } else if let record = DeletionLogService.shared.trashAndRecord(at: url, category: "SmartClean") {
+                trashedRecords.append(record)
+                print("[SmartCleaner] ✅ Moved to trash with log: \(file.name)")
                 return true
             } else {
                 print("[SmartCleaner] ⚠️ Failed to delete: \(file.name)")
@@ -2938,12 +3003,63 @@ class SmartCleanerService: ObservableObject {
                 return false
             }
         }
-        
+
         // Reset Real-time Stats
         await MainActor.run {
             self.totalCleanedSize = 0
             self.totalResolvedThreats = 0
             self.totalOptimizedItems = 0
+        }
+        
+        // 0. 清理废纸篓 (empty .Trash contents)
+        // The displayed System Junk total includes the Trash, so skipping it
+        // made "Run" delete only a fraction of the advertised size. Items
+        // inside .Trash are already trashed; remove them directly instead of
+        // trying to move .Trash itself into the Trash (which always fails).
+        if trashFiles.contains(where: { $0.isSelected }) {
+            await MainActor.run {
+                cleaningCurrentCategory = .trash
+                cleaningDescription = "Cleaning Trash..."
+            }
+            
+            let trashURL = fileManager.homeDirectoryForCurrentUser.appendingPathComponent(".Trash")
+            let manager = fileManager
+            let trashStage = await Task.detached(priority: .userInitiated) { () -> (success: Int, size: Int64, failed: Int) in
+                var success = 0
+                var freedSize: Int64 = 0
+                var failed = 0
+                guard let children = try? manager.contentsOfDirectory(at: trashURL, includingPropertiesForKeys: nil, options: []) else {
+                    return (0, 0, 0)
+                }
+                for child in children {
+                    let childSize = Self.recursiveSize(of: child)
+                    do {
+                        try manager.removeItem(at: child)
+                        success += 1
+                        freedSize += childSize
+                    } catch {
+                        print("[SmartCleaner] ⚠️ Failed to remove trash item: \(child.path) - \(error.localizedDescription)")
+                        failed += 1
+                    }
+                }
+                return (success, freedSize, failed)
+            }.value
+            
+            totalSuccess += trashStage.success
+            totalSize += trashStage.size
+            totalFailed += trashStage.failed
+            await MainActor.run {
+                self.totalCleanedSize += trashStage.size
+                // Refresh the published Trash entry so the result screen shows
+                // what is actually left over instead of the pre-clean size.
+                let remaining = Self.recursiveSize(of: trashURL)
+                trashFiles = trashFiles.compactMap { item in
+                    guard item.url.standardizedFileURL.path == trashURL.standardizedFileURL.path else { return item }
+                    guard remaining > 1024 else { return nil }
+                    return CleanerFileItem(url: item.url, name: item.name, size: remaining, groupId: item.groupId, isSelected: item.isSelected)
+                }
+                _ = cleanedCategories.insert(.trash)
+            }
         }
         
         // 1. 清理系统垃圾 (System Junk + User Cache)
@@ -2962,7 +3078,7 @@ class SmartCleanerService: ObservableObject {
            for file in systemJunk {
                // Only clean selected files
                guard file.isSelected else { continue }
-               
+
                if safeDelete(file: file, permanent: true) {
                     totalSize += file.size
                     totalSuccess += 1
@@ -3125,6 +3241,13 @@ class SmartCleanerService: ObservableObject {
         }
 
         // 10. 提权清理失败的文件
+        // 移入废纸篓不会释放空间；把本次清理产生的废纸篓记录统一回收，
+        // 保证界面统计的 "已清理" 大小与用户实际拿回的空闲空间一致。
+        if !trashedRecords.isEmpty {
+            let purged = DeletionLogService.shared.purgeTrashItems(trashedRecords)
+            print("[SmartCleaner] 🧹 Purged \(purged.count) trashed items (\(purged.bytes) bytes) to reclaim space")
+            trashedRecords.removeAll()
+        }
         if !failedFiles.isEmpty {
             var seenFailedPaths = Set<String>()
             failedFiles = failedFiles.filter {

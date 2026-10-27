@@ -34,6 +34,8 @@ enum MacAgentFindingCategory: String, Sendable {
     case largeFile
     case duplicateFile
     case startupItem
+    case xcodeJunk
+    case devCache
 }
 
 struct MacAgentFinding: Identifiable, Sendable {
@@ -91,7 +93,12 @@ final class MacMaintenanceAgentService: ObservableObject {
         let report: MacAgentToolReport
         switch tool {
         case .scanJunk:
-            let days = max(1, arguments?.olderThanDays ?? 3)
+            // No implicit age filter: caches, logs and developer junk are safe
+            // to remove regardless of when they were last touched. The previous
+            // default of "older than 3 days" made a scan on a normally-used Mac
+            // report a single file / 0 bytes, so the agent answered "0 MB of
+            // junk". An age limit is now only applied when explicitly requested.
+            let days = arguments?.olderThanDays.map { max(1, $0) }
             report = await Task.detached(priority: .userInitiated) { Self.scanJunk(olderThanDays: days) }.value
         case .scanLargeFiles:
             let minimumMB = max(10, arguments?.minimumSizeMB ?? 100)
@@ -115,7 +122,7 @@ final class MacMaintenanceAgentService: ObservableObject {
             if let lastReport, lastReport.tool == .scanJunk {
                 source = lastReport
             } else {
-                source = await Task.detached(priority: .userInitiated) { Self.scanJunk(olderThanDays: 3) }.value
+                source = await Task.detached(priority: .userInitiated) { Self.scanJunk(olderThanDays: nil) }.value
             }
             let safe = source.findings.filter(Self.isSafeCleanupFinding)
             pendingCleanup = safe
@@ -162,7 +169,7 @@ final class MacMaintenanceAgentService: ObservableObject {
         pendingCleanup = []
     }
 
-    nonisolated private static func scanJunk(olderThanDays: Int) -> MacAgentToolReport {
+    nonisolated private static func scanJunk(olderThanDays: Int?) -> MacAgentToolReport {
         let home = FileManager.default.homeDirectoryForCurrentUser
         let roots: [(URL, MacAgentFindingCategory)] = [
             (home.appendingPathComponent("Library/Caches", isDirectory: true), .userCache),
@@ -172,16 +179,85 @@ final class MacMaintenanceAgentService: ObservableObject {
             (URL(fileURLWithPath: "/Library/Caches", isDirectory: true), .systemCache),
             (URL(fileURLWithPath: "/Library/Logs", isDirectory: true), .systemLog)
         ]
-        let cutoff = Date().addingTimeInterval(-Double(olderThanDays) * 86_400)
+        let cutoff = olderThanDays.map { Date().addingTimeInterval(-Double($0) * 86_400) }
         var findings: [MacAgentFinding] = []
         for (root, category) in roots {
             findings.append(contentsOf: enumerateFiles(at: root, category: category, limit: 20_000) { values in
+                guard let cutoff else { return true }
                 guard let modified = values.contentModificationDate else { return true }
                 return modified < cutoff
             })
             if findings.count >= 20_000 { break }
         }
-        return .init(tool: .scanJunk, findings: Array(findings.prefix(20_000)), facts: ["older_than_days": String(olderThanDays)])
+        findings.append(contentsOf: scanDeveloperJunk(in: home))
+        return .init(
+            tool: .scanJunk,
+            findings: Array(findings.prefix(20_000)),
+            facts: ["older_than_days": olderThanDays.map(String.init) ?? "any"]
+        )
+    }
+
+    /// Xcode and package-manager junk reported at directory granularity.
+    /// DerivedData, DeviceSupport and simulator caches are fully regenerated
+    /// by the toolchain, so they are safe to remove regardless of age; the
+    /// whole caches of npm/Gradle/Maven/Go are equally disposable.
+    nonisolated private static func scanDeveloperJunk(in home: URL) -> [MacAgentFinding] {
+        let topLevelRoots: [(URL, MacAgentFindingCategory)] = [
+            (home.appendingPathComponent("Library/Developer/Xcode/DerivedData", isDirectory: true), .xcodeJunk),
+            (home.appendingPathComponent("Library/Developer/Xcode/iOS DeviceSupport", isDirectory: true), .xcodeJunk),
+            (home.appendingPathComponent("Library/Developer/Xcode/watchOS DeviceSupport", isDirectory: true), .xcodeJunk),
+            (home.appendingPathComponent("Library/Developer/Xcode/tvOS DeviceSupport", isDirectory: true), .xcodeJunk),
+            (home.appendingPathComponent("Library/Developer/CoreSimulator/Caches", isDirectory: true), .xcodeJunk)
+        ]
+        let wholeRoots: [(URL, MacAgentFindingCategory)] = [
+            (home.appendingPathComponent(".npm/_cacache", isDirectory: true), .devCache),
+            (home.appendingPathComponent(".gradle/caches", isDirectory: true), .devCache),
+            (home.appendingPathComponent(".m2/repository", isDirectory: true), .devCache),
+            (home.appendingPathComponent("go/pkg/mod/cache", isDirectory: true), .devCache)
+        ]
+
+        var findings: [MacAgentFinding] = []
+        for (root, category) in topLevelRoots {
+            guard let children = try? FileManager.default.contentsOfDirectory(
+                at: root, includingPropertiesForKeys: nil, options: []) else { continue }
+            for child in children {
+                let size = directorySize(of: child)
+                guard size >= 1_048_576 else { continue }
+                findings.append(.init(path: child.standardizedFileURL.path, category: category, size: size, modifiedAt: nil))
+            }
+        }
+        for (root, category) in wholeRoots {
+            let size = directorySize(of: root)
+            guard size > 0 else { continue }
+            findings.append(.init(path: root.standardizedFileURL.path, category: category, size: size, modifiedAt: nil))
+        }
+        return findings
+    }
+
+    /// Recursive on-disk size of a file or directory tree (errors are ignored).
+    nonisolated private static func directorySize(of url: URL) -> Int64 {
+        let manager = FileManager.default
+        var isDirectory: ObjCBool = false
+        guard manager.fileExists(atPath: url.path, isDirectory: &isDirectory) else { return 0 }
+
+        guard isDirectory.boolValue else {
+            return Int64((try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
+        }
+
+        guard let enumerator = manager.enumerator(
+            at: url,
+            includingPropertiesForKeys: [.fileSizeKey],
+            options: [],
+            errorHandler: { _, _ in true }
+        ) else { return 0 }
+
+        var total: Int64 = 0
+        for case let fileURL as URL in enumerator {
+            if let size = try? fileURL.resourceValues(forKeys: [.fileSizeKey]).fileSize {
+                total += Int64(size)
+            }
+        }
+        return total
     }
 
     nonisolated private static func scanLargeFiles(minimumSizeMB: Int) -> MacAgentToolReport {
@@ -340,7 +416,18 @@ final class MacMaintenanceAgentService: ObservableObject {
             "\(home)/Library/Application Support/CrashReporter/",
             "\(home)/Library/Saved Application State/",
             "/Library/Caches/",
-            "/Library/Logs/"
+            "/Library/Logs/",
+            // Xcode junk is fully regenerated by the toolchain.
+            "\(home)/Library/Developer/Xcode/DerivedData/",
+            "\(home)/Library/Developer/Xcode/iOS DeviceSupport/",
+            "\(home)/Library/Developer/Xcode/watchOS DeviceSupport/",
+            "\(home)/Library/Developer/Xcode/tvOS DeviceSupport/",
+            "\(home)/Library/Developer/CoreSimulator/Caches/",
+            // Package-manager dependency caches.
+            "\(home)/.npm/_cacache",
+            "\(home)/.gradle/caches",
+            "\(home)/.m2/repository",
+            "\(home)/go/pkg/mod/cache"
         ]
         let normalized = URL(fileURLWithPath: finding.path).standardizedFileURL.path
         return allowedRoots.contains(where: normalized.hasPrefix)

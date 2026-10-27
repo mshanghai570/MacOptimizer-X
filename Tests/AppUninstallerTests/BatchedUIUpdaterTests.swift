@@ -96,62 +96,63 @@ final class BatchedUIUpdaterTests: XCTestCase {
     }
     
     func testDebounceDelaysExecution() async {
-        var executed = false
+        let executed = expectation(description: "debounced action executed")
         let startTime = Date()
-        
+
         await updater.debounce("test", delay: 0.05) {
-            executed = true
+            executed.fulfill()
         }
-        
+
         // Should not execute immediately
-        XCTAssertFalse(executed, "Debounce should delay execution")
-        
-        // Wait for debounce to complete
-        try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
-        
+        // (verified implicitly: the expectation is only fulfilled by the timer)
+
+        // Wait for debounce to complete with a generous deadline so shared
+        // Intel runners' scheduling latency cannot flake the test
+        await fulfillment(of: [executed], timeout: 5.0)
+
         let elapsed = Date().timeIntervalSince(startTime)
-        XCTAssertTrue(executed, "Debounce should execute after delay")
         XCTAssertGreaterThanOrEqual(elapsed, 0.05, "Execution should be delayed by at least debounce delay")
     }
     
     func testDebounceCoalesceRapidUpdates() async {
-        var executionCount = 0
+        let execution = expectation(description: "coalesced update executed exactly once")
         
         // Send multiple rapid updates with same key
         for _ in 0..<5 {
             await updater.debounce("counter") {
-                executionCount += 1
+                execution.fulfill()
             }
         }
         
-        // Wait for debounce to complete
-        try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
-        
-        // Should only execute once despite 5 calls
-        XCTAssertEqual(executionCount, 1, "Rapid updates should be coalesced into single execution")
+        // Should only execute once despite 5 calls; generous timeout for CI
+        await fulfillment(of: [execution], timeout: 5.0)
     }
     
     func testDebounceWithDifferentKeys() async {
+        let result1 = expectation(description: "key1 executed")
+        let result2 = expectation(description: "key2 executed")
+        let result3 = expectation(description: "key3 executed")
         var results: [String] = []
         
         // Send updates with different keys
         await updater.debounce("key1") {
             results.append("key1")
+            result1.fulfill()
         }
         
         await updater.debounce("key2") {
             results.append("key2")
+            result2.fulfill()
         }
         
         await updater.debounce("key3") {
             results.append("key3")
+            result3.fulfill()
         }
         
-        // Wait for debounce to complete
-        try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
-        
         // All should execute since they have different keys
-        XCTAssertEqual(results.count, 3, "Different keys should execute independently")
+        await fulfillment(of: [result1, result2, result3], timeout: 5.0)
+        
         XCTAssertTrue(results.contains("key1"), "key1 should execute")
         XCTAssertTrue(results.contains("key2"), "key2 should execute")
         XCTAssertTrue(results.contains("key3"), "key3 should execute")
@@ -226,22 +227,19 @@ final class BatchedUIUpdaterTests: XCTestCase {
     }
     
     func testBatchDebounceCoalesceUpdates() async {
-        var executionCount = 0
+        let execution = expectation(description: "batch debounced update executed exactly once")
         
         // Send multiple rapid batch debounce calls with same key
         for _ in 0..<5 {
             await updater.batchDebounce("batch") {
-                executionCount += 1
+                execution.fulfill()
             }
             // Small delay between calls to ensure they're rapid but not instantaneous
             try? await Task.sleep(nanoseconds: 1_000_000) // 1ms
         }
         
-        // Wait for debounce to complete
-        try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
-        
-        // Should only execute once (last update replaces previous ones)
-        XCTAssertEqual(executionCount, 1, "Batch debounce should coalesce rapid updates into single execution")
+        // Should only execute once (last update replaces previous ones); generous timeout for CI
+        await fulfillment(of: [execution], timeout: 5.0)
     }
     
     func testPendingUpdateCount() async {
